@@ -21,7 +21,7 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 | --- | --- | --- |
 | Test Bot | Forecasts on the unscored [bot testing area](https://www.metaculus.com/tournament/bot-testing-area/). Choose the lanes, how many questions (3 by default) and whether to submit. | Manual |
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
-| Forecast on new AI tournament questions | The live tournament and MiniBench. | Manual; the 20-minute schedule is commented out in the workflow file until the bot is ready |
+| Forecast on new AI tournament questions | The live tournament and MiniBench. Prize-eligible. | Every 20 minutes. Pause it with "Disable workflow" in the Actions tab |
 
 Every comment the bot posts on Metaculus ends with a `RECORD` section: one line of JSON with the bot's commit, each lane's individual forecasts and costs, and the final forecast. Once questions resolve, this is what later analysis reads (for example "Claude only" against "GPT only" against the aggregate).
 

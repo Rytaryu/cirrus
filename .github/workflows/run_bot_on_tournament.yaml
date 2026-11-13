@@ -1,13 +1,14 @@
 name: Forecast on new AI tournament questions
 
 # This workflow submits prize-eligible forecasts to the live tournament and
-# MiniBench. The schedule is switched off until the rollout reaches stage 3
-# (see the design doc). To start forecasting every 20 minutes, uncomment the
-# two "schedule" lines below and commit to main.
+# MiniBench. Questions are open for about 3 hours, and a question that already
+# has a forecast is skipped, so each question is forecast once.
+#
+# To pause the bot: Actions tab -> this workflow -> "..." -> Disable workflow.
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "7,27,47 * * * *" # every 20 min, offset off the hour
+  schedule:
+    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour
 
 # The job token is only used to check out this public repository.
 permissions:
