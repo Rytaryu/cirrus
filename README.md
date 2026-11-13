@@ -19,7 +19,7 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 
 | Workflow | What it does | Trigger |
 | --- | --- | --- |
-| Test Bot | Forecasts on the unscored [bot testing area](https://www.metaculus.com/tournament/bot-testing-area/). Choose the lanes and whether to submit. | Manual |
+| Test Bot | Forecasts on the unscored [bot testing area](https://www.metaculus.com/tournament/bot-testing-area/). Choose the lanes, how many questions (3 by default) and whether to submit. | Manual |
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
 | Forecast on new AI tournament questions | The live tournament and MiniBench. | Manual; the 20-minute schedule is commented out in the workflow file until the bot is ready |
 

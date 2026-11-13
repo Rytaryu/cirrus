@@ -52,10 +52,23 @@ from forecasting_tools.data_models.forecast_report import (  # noqa: E402
     ResearchWithPredictions,
 )
 
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (  # noqa: E402
+    LitellmCostTracker,
+)
+
 from main import FallTemplateBot2026  # noqa: E402
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# forecasting-tools records the cost of a model call in two places: directly
+# after the call returns, and again from a litellm callback. With the litellm
+# version in uv.lock the callback runs after the direct path has already added
+# the cost, so every call was counted twice (seen on 2026-11-13: reported costs
+# were exactly double the token prices). Marking the tracker as initialized
+# keeps the callback from being installed, which leaves the direct path only.
+# tests/test_cirrus.py checks the reported cost against known token counts.
+LitellmCostTracker._initialized = True
 
 
 class ResponsesLlm(GeneralLlm):
@@ -91,16 +104,18 @@ class ResponsesLlm(GeneralLlm):
 # provider outweighs the other in the median.
 PREDICTIONS_PER_LANE = 2
 
-# Safety stop, in USD, on what one lane may spend on one question. Once a lane
-# has spent this much, it makes no further model calls for that question (its
-# remaining forecasts fail and the other lane carries the question). The target
-# is about $0.20 per lane per question; this stop only catches runaway cases.
+# Safety stop, in USD, per lane per question. If a lane's research alone costs
+# more than this, the lane makes no forecasts for that question and the other
+# lane carries it. The target is about $0.20 per lane per question; this stop
+# only catches runaway cases.
 LANE_COST_CAP_USD = 0.50
 
 # How many questions' research may run at the same time.
 MAX_CONCURRENT_RESEARCH = 4
 
-# Web searches the Claude researcher may run per question.
+# Web searches the Claude researcher may run per question. Search results are
+# billed as input tokens and are re-read on every later step, so this is the
+# main driver of the Claude lane's cost.
 CLAUDE_MAX_SEARCHES = 3
 
 
@@ -244,6 +259,14 @@ def build_llms(lanes: list[Lane]) -> dict[str, str | GeneralLlm | None]:
 _current_lane: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "cirrus_current_lane", default=None
 )
+# What the current lane has spent on the current question so far.
+_lane_spend: contextvars.ContextVar[MonetaryCostManager | None] = contextvars.ContextVar(
+    "cirrus_lane_spend", default=None
+)
+
+
+class LaneCostCapReached(RuntimeError):
+    """A lane spent more than LANE_COST_CAP_USD on one question's research."""
 
 
 # =============================================================================
@@ -280,8 +303,12 @@ def notify_discord(message: str) -> None:
 
 @dataclass
 class LaneStats:
-    costs: list[float] = field(default_factory=list)
+    costs: list[float] = field(default_factory=list)  # one entry per question
     failures: list[str] = field(default_factory=list)
+    # Where the money went, summed over the run.
+    research_cost: float = 0.0
+    summary_cost: float = 0.0
+    forecast_cost: float = 0.0  # forecasts and the parsing of their output
 
 
 class Cirrus(FallTemplateBot2026):
@@ -349,10 +376,13 @@ class Cirrus(FallTemplateBot2026):
         token = _current_lane.set(lane.name)
         stats = self.lane_stats[lane.name]
         try:
-            with MonetaryCostManager(LANE_COST_CAP_USD) as cost_manager:
+            # A limit of 0 means "track only"; the cap is checked in _make_prediction.
+            with MonetaryCostManager(0) as cost_manager:
+                spend_token = _lane_spend.set(cost_manager)
                 try:
                     result = await super()._research_and_make_predictions(question)
                 finally:
+                    _lane_spend.reset(spend_token)
                     stats.costs.append(cost_manager.current_usage)
                     logger.info(
                         f"[{lane.name}] spent about ${cost_manager.current_usage:.4f} "
@@ -379,16 +409,41 @@ class Cirrus(FallTemplateBot2026):
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
     ) -> ReasonedPrediction:
-        # Raises once this lane has reached LANE_COST_CAP_USD for the question.
-        MonetaryCostManager.raise_error_if_limit_would_be_reached()
-        return await super()._make_prediction(question, research)
+        spend = _lane_spend.get()
+        if spend is not None and spend.current_usage >= LANE_COST_CAP_USD:
+            raise LaneCostCapReached(
+                f"Research cost about ${spend.current_usage:.2f}, which is over the "
+                f"${LANE_COST_CAP_USD:.2f} cap per lane per question."
+            )
+        with MonetaryCostManager(0) as cost_manager:
+            try:
+                return await super()._make_prediction(question, research)
+            finally:
+                self._add_cost("forecast_cost", cost_manager.current_usage)
+
+    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+        with MonetaryCostManager(0) as cost_manager:
+            try:
+                return await super().summarize_research(question, research)
+            finally:
+                self._add_cost("summary_cost", cost_manager.current_usage)
+
+    def _add_cost(self, kind: str, amount: float) -> None:
+        lane = _current_lane.get()
+        if lane in self.lane_stats:
+            stats = self.lane_stats[lane]
+            setattr(stats, kind, getattr(stats, kind) + amount)
 
     # --------------------------------------------------------------- research
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._research_limiter:
             researcher = self.get_llm("researcher", "llm")
-            research = await researcher.invoke(self._research_prompt(question))
+            with MonetaryCostManager(0) as cost_manager:
+                try:
+                    research = await researcher.invoke(self._research_prompt(question))
+                finally:
+                    self._add_cost("research_cost", cost_manager.current_usage)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -432,6 +487,11 @@ class Cirrus(FallTemplateBot2026):
                 f"  {name}: {attempts} question(s), about ${total:.4f} in total, "
                 f"${total / attempts:.4f} per question, {len(stats.failures)} failure(s)"
             )
+            lines.append(
+                f"    per question: research ${stats.research_cost / attempts:.4f}, "
+                f"forecasts ${stats.forecast_cost / attempts:.4f}, "
+                f"summary ${stats.summary_cost / attempts:.4f}"
+            )
         return "\n".join(lines)
 
     def notify_lane_failures(self, run_mode: str) -> None:
@@ -457,7 +517,22 @@ TOURNAMENT_URLS = {
 }
 
 
-async def run(bot: Cirrus, run_mode: RunMode) -> list:
+def pick_sample(questions: list[MetaculusQuestion], limit: int) -> list[MetaculusQuestion]:
+    """Up to `limit` questions, taking a different question type each time."""
+    if limit <= 0 or len(questions) <= limit:
+        return questions
+    by_type: dict[str, list[MetaculusQuestion]] = {}
+    for question in questions:
+        by_type.setdefault(type(question).__name__, []).append(question)
+    picked: list[MetaculusQuestion] = []
+    while len(picked) < limit:
+        for group in by_type.values():
+            if group and len(picked) < limit:
+                picked.append(group.pop(0))
+    return picked
+
+
+async def run(bot: Cirrus, run_mode: RunMode, max_questions: int = 0) -> list:
     client = MetaculusClient()
     if run_mode == "tournament":
         seasonal_reports = await bot.forecast_on_tournament(
@@ -477,9 +552,12 @@ async def run(bot: Cirrus, run_mode: RunMode) -> list:
     # test_questions: the bot-testing-area tournament is unscored and has one
     # question of every type. https://www.metaculus.com/tournament/bot-testing-area/
     bot.skip_previously_forecasted_questions = False
-    return list(
-        await bot.forecast_on_tournament("bot-testing-area", return_exceptions=True)
+    questions = bot.metaculus_client.get_all_open_questions_from_tournament(
+        "bot-testing-area"
     )
+    sample = pick_sample(questions, max_questions)
+    print(f"Forecasting on {len(sample)} of {len(questions)} test questions.\n")
+    return list(await bot.forecast_questions(sample, return_exceptions=True))
 
 
 def main() -> None:
@@ -502,6 +580,13 @@ def main() -> None:
         default=None,
         help="Lanes to run: both, claude, gpt or a comma-separated list "
         "(default: the CIRRUS_LANES env var, else both)",
+    )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=0,
+        help="In test_questions mode, forecast on at most this many questions, "
+        "one per question type first (default: 0 = all)",
     )
     parser.add_argument(
         "--no-publish",
@@ -537,7 +622,7 @@ def main() -> None:
 
     # One event loop for the whole run: the bot's semaphore and the provider
     # clients must not be shared between loops.
-    forecast_reports = asyncio.run(run(bot, run_mode))
+    forecast_reports = asyncio.run(run(bot, run_mode, args.max_questions))
 
     print(bot.lane_report())
     bot.notify_lane_failures(run_mode)
