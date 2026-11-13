@@ -21,7 +21,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextvars
+import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -297,6 +299,58 @@ def notify_discord(message: str) -> None:
         logger.warning(f"Discord notification failed: {type(error).__name__}")
 
 
+# =============================================================================
+# RECORDS
+# =============================================================================
+#
+# Every comment the bot posts ends with a "RECORD" section: one line of JSON
+# with the bot version, each lane's individual forecasts and costs, and the
+# final forecast. Metaculus keeps the comments, so the full history of what
+# each lane predicted can be rebuilt from Metaculus alone once questions
+# resolve (for example to compare "Claude only", "GPT only" and the aggregate).
+
+RECORD_VERSION = 1
+_LANE_MARKER = re.compile(r"^\*Lane: (\w+)")
+_MAX_RECORDED_PERCENTILES = 11
+
+
+def compact_prediction(prediction: object) -> object:
+    """A small JSON-friendly form of any prediction type the bot produces."""
+    if isinstance(prediction, bool):
+        return prediction
+    if isinstance(prediction, (int, float)):
+        return round(float(prediction), 4)
+    options = getattr(prediction, "predicted_options", None)
+    if options is not None:
+        return {option.option_name: round(option.probability, 4) for option in options}
+    percentiles = getattr(prediction, "declared_percentiles", None)
+    if percentiles is not None:
+        points = [[round(p.percentile, 4), p.value] for p in percentiles]
+        if len(points) > _MAX_RECORDED_PERCENTILES:
+            step = math.ceil(len(points) / (_MAX_RECORDED_PERCENTILES - 1))
+            points = points[::step] + ([points[-1]] if (len(points) - 1) % step else [])
+        return points
+    parts = ("parent", "child", "prediction_yes", "prediction_no")
+    if all(hasattr(prediction, part) for part in parts):
+        return {part: compact_prediction(getattr(prediction, part)) for part in parts}
+    if type(prediction).__name__ == "PredictionAffirmed":
+        return "affirmed"
+    return str(prediction)[:200]
+
+
+def bot_version() -> str:
+    """The commit the bot is running from (set by GitHub Actions)."""
+    return (os.getenv("GITHUB_SHA") or "local")[:7]
+
+
+def read_record(comment: str) -> dict | None:
+    """The record stored in a comment written by this bot, if there is one."""
+    for line in reversed(comment.splitlines()):
+        if line.startswith('{"cirrus_record":'):
+            return json.loads(line)
+    return None
+
+
 def github_run_url() -> str | None:
     """Link to the current GitHub Actions run, when running in one."""
     server = os.getenv("GITHUB_SERVER_URL")
@@ -348,6 +402,8 @@ class Cirrus(FallTemplateBot2026):
             lane.name: LaneStats() for lane in self.lanes
         }
         self._lane_turn: dict[int, int] = {}
+        # question URL -> lane -> {"cost": ..., "error": ...}, for the record.
+        self._lane_outcomes: dict[str, dict[str, dict]] = {}
         self._research_limiter = asyncio.Semaphore(MAX_CONCURRENT_RESEARCH)
 
     @classmethod
@@ -386,6 +442,8 @@ class Cirrus(FallTemplateBot2026):
         lane = self._take_lane(question)
         token = _current_lane.set(lane.name)
         stats = self.lane_stats[lane.name]
+        outcome: dict = {}
+        self._lane_outcomes.setdefault(question.page_url, {})[lane.name] = outcome
         try:
             # A limit of 0 means "track only"; the cap is checked in _make_prediction.
             with MonetaryCostManager(0) as cost_manager:
@@ -395,6 +453,7 @@ class Cirrus(FallTemplateBot2026):
                 finally:
                     _lane_spend.reset(spend_token)
                     stats.costs.append(cost_manager.current_usage)
+                    outcome["cost"] = round(cost_manager.current_usage, 4)
                     logger.info(
                         f"[{lane.name}] spent about ${cost_manager.current_usage:.4f} "
                         f"on {question.page_url}"
@@ -403,6 +462,7 @@ class Cirrus(FallTemplateBot2026):
             stats.failures.append(
                 f"{question.page_url}: {type(error).__name__}: {scrub(str(error))}"
             )
+            outcome["error"] = type(error).__name__
             logger.error(f"[{lane.name}] lane failed on {question.page_url}: {error}")
             raise
         finally:
@@ -482,6 +542,70 @@ class Cirrus(FallTemplateBot2026):
             Give the source URL next to every fact. Do not state a probability or a forecast of your own.
             """
         )
+
+    # ---------------------------------------------------------------- records
+
+    def build_record(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections: list[ResearchWithPredictions],
+        aggregated_prediction: object,
+        final_cost: float,
+    ) -> dict:
+        lanes: dict[str, dict] = {}
+        for name, outcome in self._lane_outcomes.get(question.page_url, {}).items():
+            lanes[name] = {
+                "research_model": self.get_llm(f"{name}/researcher", "llm").model,
+                "forecast_model": self.get_llm(f"{name}/default", "llm").model,
+                "predictions": [],
+                **outcome,
+            }
+        for collection in research_prediction_collections:
+            marker = _LANE_MARKER.match(collection.research_report)
+            if marker and marker.group(1) in lanes:
+                lanes[marker.group(1)]["predictions"] = [
+                    compact_prediction(p.prediction_value) for p in collection.predictions
+                ]
+        return {
+            "cirrus_record": RECORD_VERSION,
+            "commit": bot_version(),
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "question": {
+                "post": question.id_of_post,
+                "id": question.id_of_question,
+                "type": type(question).__name__,
+                "url": question.page_url,
+            },
+            "lanes": lanes,
+            "final": compact_prediction(aggregated_prediction),
+            "cost": round(final_cost, 4),
+        }
+
+    def _create_comment(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections: list[ResearchWithPredictions],
+        aggregated_prediction: object,
+        final_cost: float,
+        time_spent_in_minutes: float,
+    ) -> str:
+        comment = super()._create_comment(
+            question,
+            research_prediction_collections,
+            aggregated_prediction,  # type: ignore[arg-type]
+            final_cost,
+            time_spent_in_minutes,
+        )
+        try:
+            record = self.build_record(
+                question, research_prediction_collections, aggregated_prediction, final_cost
+            )
+            line = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+        except Exception as error:  # noqa: BLE001
+            # The record is bookkeeping: never let it stop a forecast.
+            logger.warning(f"Could not build the record for {question.page_url}: {error}")
+            return comment
+        return f"{comment.rstrip()}\n\n# RECORD\n```\n{line}\n```\n"
 
     # -------------------------------------------------------------- reporting
 
@@ -642,13 +766,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def log_level_for(run_mode: str) -> int:
+    """
+    Detailed logs (research, reasoning, forecasts) are off in tournament mode.
+    The logs of a public repository can be read by anyone, and forecasts on
+    open tournament questions should stay private until the questions close.
+    Warnings, errors, costs and question links are still shown.
+    """
+    return logging.WARNING if run_mode == "tournament" else logging.INFO
+
+
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
     args = parse_args()
     run_mode: RunMode = args.mode
+    logging.basicConfig(
+        level=log_level_for(run_mode),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     if args.lanes:
         os.environ["CIRRUS_LANES"] = args.lanes
 
@@ -663,7 +797,10 @@ def main() -> None:
             f"Lane(s) {missing} skipped: "
             f"{[LANES[name].api_key_env for name in missing]} not set."
         )
-    print(f"Lanes: {[lane.name for lane in lanes]}\n")
+    print(f"Lanes: {[lane.name for lane in lanes]}")
+    if log_level_for(run_mode) > logging.INFO:
+        print("Detailed logs are off in tournament mode; see the comments on Metaculus.")
+    print()
 
     bot = Cirrus(
         lanes=lanes,

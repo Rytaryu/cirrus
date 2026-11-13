@@ -313,6 +313,67 @@ class CirrusTests(unittest.TestCase):
         self.assertTrue(cirrus.parse_args(["--mode", "test_questions", "--no-publish"]).no_publish)
         self.assertEqual(cirrus.parse_args([]).mode, "tournament")
 
+    def test_comment_ends_with_a_record_of_each_lane(self) -> None:
+        os.environ["GITHUB_SHA"] = "abc1234def"
+        try:
+            _, reports = forecast([make_question(1)])
+        finally:
+            os.environ.pop("GITHUB_SHA")
+        report = reports[0]
+        record = cirrus.read_record(report.explanation)
+        self.assertEqual(record["cirrus_record"], 1)
+        self.assertEqual(record["commit"], "abc1234")
+        self.assertEqual(record["question"]["type"], "BinaryQuestion")
+        self.assertEqual(record["question"]["url"], "https://example.com/q/1")
+        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3, 0.3])
+        self.assertEqual(record["lanes"]["gpt"]["predictions"], [0.5, 0.5])
+        self.assertEqual(record["lanes"]["claude"]["forecast_model"], "anthropic/claude-opus-5-5")
+        self.assertGreater(record["lanes"]["gpt"]["cost"], 0)
+        self.assertEqual(record["final"], 0.4)
+        # The template's own sections are still where it expects them.
+        self.assertIn("SUMMARY", report.summary)
+        self.assertIn("Probability: 30%", report.first_rationale)
+
+    def test_record_marks_a_failed_lane(self) -> None:
+        DOWN["openai"] = True
+        _, reports = forecast([make_question(1)])
+        record = cirrus.read_record(reports[0].explanation)
+        self.assertEqual(record["lanes"]["gpt"]["error"], "RateLimitError")
+        self.assertEqual(record["lanes"]["gpt"]["predictions"], [])
+        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3, 0.3])
+        self.assertEqual(record["final"], 0.3)
+
+    def test_compact_prediction_handles_every_prediction_type(self) -> None:
+        from forecasting_tools import NumericDistribution, Percentile, PredictedOptionList
+        from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+
+        options = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="A", probability=0.7),
+                PredictedOption(option_name="B", probability=0.3),
+            ]
+        )
+        self.assertEqual(cirrus.compact_prediction(options), {"A": 0.7, "B": 0.3})
+        numeric = NumericDistribution(
+            declared_percentiles=[Percentile(percentile=p / 100, value=float(p)) for p in range(5, 100, 5)],
+            open_upper_bound=True,
+            open_lower_bound=True,
+            upper_bound=100,
+            lower_bound=0,
+            zero_point=None,
+        )
+        points = cirrus.compact_prediction(numeric)
+        self.assertLessEqual(len(points), 11)
+        self.assertEqual(points[0], [0.05, 5.0])
+        self.assertEqual(points[-1], [0.95, 95.0])
+        self.assertEqual(cirrus.compact_prediction(0.123456), 0.1235)
+
+    def test_tournament_mode_hides_detailed_logs(self) -> None:
+        import logging
+
+        self.assertEqual(cirrus.log_level_for("tournament"), logging.WARNING)
+        self.assertEqual(cirrus.log_level_for("test_questions"), logging.INFO)
+
     def test_scrub_hides_key_like_strings(self) -> None:
         cleaned = cirrus.scrub("Incorrect API key provided: sk-proj-abcdEFGH12345678\nnext line")
         self.assertNotIn("sk-proj", cleaned)
