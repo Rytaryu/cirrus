@@ -1,3 +1,40 @@
+# cirrus
+
+cirrus is a forecasting bot for the [Metaculus FutureEval](https://www.metaculus.com/futureeval/) bot tournaments. It is built on the Metaculus template bot (the template's own README follows below) and runs on GitHub Actions.
+
+## How it forecasts
+
+Every question is handled by two independent **lanes**, one per AI provider:
+
+| Lane | Research (with the provider's web search) | Forecasts | Parsing and summaries |
+| --- | --- | --- | --- |
+| `claude` | Claude Sonnet 5.5 | Claude Opus 5.5, 2 per question | Claude Haiku 5.5 |
+| `gpt` | GPT-6.1 Sol | GPT-6.1 Sol, 2 per question | GPT-6 Luna |
+
+A lane's forecasters only see that lane's research. The four forecasts are then combined by the template's aggregation (the median for binary questions). If one lane fails, for example because its API credits ran out, the other lane's forecasts are still submitted and a notice goes to Discord.
+
+The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFIGURATION` section. `main.py` is the unmodified template, which `cirrus.py` builds on.
+
+## Running it
+
+| Workflow | What it does | Trigger |
+| --- | --- | --- |
+| Test Bot | Forecasts on the unscored [bot testing area](https://www.metaculus.com/tournament/bot-testing-area/). Choose the lanes and whether to submit. | Manual |
+| Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
+| Forecast on new AI tournament questions | The live tournament and MiniBench. | Manual; the 20-minute schedule is commented out in the workflow file until the bot is ready |
+
+Repository secrets used: `METACULUS_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and, optionally, `DISCORD_WEBHOOK_URL`. A lane whose key is missing is skipped.
+
+Locally:
+
+```
+uv sync --locked
+uv run python cirrus.py --mode test_questions --lanes claude --no-publish
+uv run python -m unittest discover -s tests   # offline tests, no API calls
+```
+
+---
+
 # Simple Metaculus forecasting bot
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
