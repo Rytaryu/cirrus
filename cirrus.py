@@ -41,6 +41,7 @@ from bot_helpers import (
 silence_noisy_dependencies()
 
 from forecasting_tools import (  # noqa: E402
+    ForecastReport,
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
@@ -296,6 +297,16 @@ def notify_discord(message: str) -> None:
         logger.warning(f"Discord notification failed: {type(error).__name__}")
 
 
+def github_run_url() -> str | None:
+    """Link to the current GitHub Actions run, when running in one."""
+    server = os.getenv("GITHUB_SERVER_URL")
+    repository = os.getenv("GITHUB_REPOSITORY")
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if server and repository and run_id:
+        return f"{server}/{repository}/actions/runs/{run_id}"
+    return None
+
+
 # =============================================================================
 # THE BOT
 # =============================================================================
@@ -494,14 +505,45 @@ class Cirrus(FallTemplateBot2026):
             )
         return "\n".join(lines)
 
-    def notify_lane_failures(self, run_mode: str) -> None:
-        failed = {name: s.failures for name, s in self.lane_stats.items() if s.failures}
-        if not failed:
-            return
-        parts = [f"cirrus ({run_mode}): a lane failed, the other lane carried on where it could."]
-        for name, failures in failed.items():
-            parts.append(f"- {name}: {len(failures)} question(s). First error: {failures[0]}")
-        notify_discord("\n".join(parts))
+    def run_message(self, run_mode: str, reports: list, published: bool) -> str | None:
+        """
+        The Discord message for one run: what was submitted, what it cost and
+        what failed. None when the run had nothing to forecast.
+        """
+        done = [r for r in reports if isinstance(r, ForecastReport)]
+        failed = [r for r in reports if isinstance(r, BaseException)]
+        lane_failures = {n: s.failures for n, s in self.lane_stats.items() if s.failures}
+        if not done and not failed and not lane_failures:
+            return None
+
+        verb = "submitted" if published else "produced without submitting"
+        lines = [f"cirrus ({run_mode}): {verb} {len(done)} forecast(s), {len(failed)} question(s) failed."]
+        costs = [
+            f"{name} ${sum(stats.costs):.2f}"
+            for name, stats in self.lane_stats.items()
+            if stats.costs
+        ]
+        if costs:
+            lines.append("Cost (estimate): " + ", ".join(costs))
+        for name, failures in lane_failures.items():
+            lines.append(
+                f"Lane {name} failed on {len(failures)} question(s). First error: {failures[0]}"
+            )
+        # <...> keeps Discord from adding a preview card for every link.
+        shown = 8
+        for report in done[:shown]:
+            lines.append(f"- <{report.question.page_url}>")
+        if len(done) > shown:
+            lines.append(f"- and {len(done) - shown} more")
+        run_url = github_run_url()
+        if run_url:
+            lines.append(f"Run: <{run_url}>")
+        return "\n".join(lines)
+
+    def notify_run(self, run_mode: str, reports: list, published: bool) -> None:
+        message = self.run_message(run_mode, reports, published)
+        if message:
+            notify_discord(message)
 
 
 # =============================================================================
@@ -560,12 +602,7 @@ async def run(bot: Cirrus, run_mode: RunMode, max_questions: int = 0) -> list:
     return list(await bot.forecast_questions(sample, return_exceptions=True))
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the cirrus forecasting bot")
     parser.add_argument(
         "--mode",
@@ -593,7 +630,24 @@ def main() -> None:
         action="store_true",
         help="Forecast without submitting anything to Metaculus",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.mode == "tournament" and args.no_publish:
+        # Tournament rules: a bot maker may not preview how the bot forecasts
+        # on open tournament questions. A dry run there would be such a preview.
+        parser.error(
+            "--no-publish cannot be used with --mode tournament: the tournament "
+            "rules forbid previewing forecasts on open tournament questions. "
+            "Use --mode test_questions for dry runs."
+        )
+    return args
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    args = parse_args()
     run_mode: RunMode = args.mode
     if args.lanes:
         os.environ["CIRRUS_LANES"] = args.lanes
@@ -625,7 +679,7 @@ def main() -> None:
     forecast_reports = asyncio.run(run(bot, run_mode, args.max_questions))
 
     print(bot.lane_report())
-    bot.notify_lane_failures(run_mode)
+    bot.notify_run(run_mode, forecast_reports, publish_to_metaculus)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,

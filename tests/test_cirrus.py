@@ -287,6 +287,32 @@ class CirrusTests(unittest.TestCase):
         self.assertEqual(len(cirrus.pick_sample(binary, 0)), 3)
         self.assertEqual(len(cirrus.pick_sample(binary, 10)), 3)
 
+    def test_run_message_reports_submissions_costs_and_lane_failures(self) -> None:
+        DOWN["openai"] = True
+        bot, reports = forecast([make_question(1), make_question(2)])
+        os.environ.update(GITHUB_SERVER_URL="https://github.com", GITHUB_REPOSITORY="o/r", GITHUB_RUN_ID="7")
+        try:
+            message = bot.run_message("tournament", reports, published=True)
+        finally:
+            for name in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"):
+                os.environ.pop(name)
+        self.assertIn("submitted 2 forecast(s), 0 question(s) failed", message)
+        self.assertIn("claude $", message)
+        self.assertIn("Lane gpt failed on 2 question(s)", message)
+        self.assertIn("- <https://example.com/q/1>", message)
+        self.assertIn("Run: <https://github.com/o/r/actions/runs/7>", message)
+        self.assertLess(len(message), 1900)
+
+    def test_run_message_is_empty_when_nothing_happened(self) -> None:
+        bot, reports = forecast([])
+        self.assertIsNone(bot.run_message("tournament", reports, published=True))
+
+    def test_tournament_mode_refuses_dry_runs(self) -> None:
+        with self.assertRaises(SystemExit):
+            cirrus.parse_args(["--mode", "tournament", "--no-publish"])
+        self.assertTrue(cirrus.parse_args(["--mode", "test_questions", "--no-publish"]).no_publish)
+        self.assertEqual(cirrus.parse_args([]).mode, "tournament")
+
     def test_scrub_hides_key_like_strings(self) -> None:
         cleaned = cirrus.scrub("Incorrect API key provided: sk-proj-abcdEFGH12345678\nnext line")
         self.assertNotIn("sk-proj", cleaned)
