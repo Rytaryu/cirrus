@@ -116,6 +116,9 @@ LANE_COST_CAP_USD = 0.50
 # How many questions' research may run at the same time.
 MAX_CONCURRENT_RESEARCH = 4
 
+# Reasoning effort of the GPT forecaster: low, medium, high, xhigh or max.
+GPT_FORECAST_EFFORT = "medium"
+
 # Web searches the Claude researcher may run per question. Search results are
 # billed as input tokens and are re-read on every later step, so this is the
 # main driver of the Claude lane's cost.
@@ -187,10 +190,16 @@ LANES: dict[str, Lane] = {
             timeout=300,
             allowed_tries=2,
         ),
+        # GPT-6 Astra ($10 / $50), OpenAI's most capable model. The first test
+        # runs used GPT-6.1 Sol here and the lane cost about $0.14 per question,
+        # of which the two forecasts were only $0.02; the judgment step is where
+        # the lane's spare budget goes. Reasoning tokens are billed as output,
+        # so the effort setting is the main cost control.
         forecaster=lambda: ResponsesLlm(
-            model="openai/gpt-6.1-sol",
-            max_output_tokens=8000,
-            timeout=240,
+            model="openai/gpt-6-astra",
+            reasoning={"effort": GPT_FORECAST_EFFORT},
+            max_output_tokens=12000,
+            timeout=300,
             allowed_tries=2,
         ),
         # GPT-6 Luna ($0.10 / $0.50).
