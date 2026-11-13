@@ -9,7 +9,7 @@ Every question is handled by two independent **lanes**, one per AI provider:
 | Lane | Research (with the provider's web search) | Forecasts | Parsing and summaries |
 | --- | --- | --- | --- |
 | `claude` | Claude Sonnet 5.5 | Claude Opus 5.5, 2 per question | Claude Haiku 5.5 |
-| `gpt` | GPT-6.1 Sol | GPT-6.1 Sol, 2 per question | GPT-6 Luna |
+| `gpt` | GPT-6.1 Sol | GPT-6 Astra, 2 per question | GPT-6 Luna |
 
 A lane's forecasters only see that lane's research. The four forecasts are then combined by the template's aggregation (the median for binary questions). If one lane fails, for example because its API credits ran out, the other lane's forecasts are still submitted and a notice goes to Discord.
 

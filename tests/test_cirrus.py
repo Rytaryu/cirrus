@@ -172,7 +172,7 @@ class CirrusTests(unittest.TestCase):
         self.assertIn(("/v1/messages", "claude-opus-5-5", "null"), seen)
         self.assertIn(("/v1/messages", "claude-haiku-5-5", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6.1-sol", gpt_search), seen)
-        self.assertIn(("/v1/responses", "gpt-6.1-sol", "null"), seen)
+        self.assertIn(("/v1/responses", "gpt-6-astra", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6-luna", "null"), seen)
 
     def test_each_lane_only_sees_its_own_research(self) -> None:
@@ -250,7 +250,7 @@ class CirrusTests(unittest.TestCase):
     def test_reported_cost_matches_token_prices(self) -> None:
         # Prices in USD per token (input, output), from the providers' price lists.
         sonnet, opus, haiku = (2e-6, 1e-5), (4e-6, 2e-5), (1e-7, 5e-7)
-        sol, luna = (2e-6, 1e-5), (1e-7, 5e-7)
+        sol, astra, luna = (2e-6, 1e-5), (1e-5, 5e-5), (1e-7, 5e-7)
         search = 0.01  # one web search
         forecasts = cirrus.PREDICTIONS_PER_LANE
         parses = forecasts * 2  # each forecast is parsed twice for validation
@@ -268,7 +268,7 @@ class CirrusTests(unittest.TestCase):
         gpt = (
             cost(sol, 3000, 500) + search
             + cost(luna, 3000, 500)
-            + forecasts * cost(sol, 3000, 500)
+            + forecasts * cost(astra, 3000, 500)
             + parses * cost(luna, 3000, 500)
         )
         bot, reports = forecast([make_question(1)])
