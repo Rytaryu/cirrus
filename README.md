@@ -23,6 +23,10 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
 | Forecast on new AI tournament questions | The live tournament and MiniBench. | Manual; the 20-minute schedule is commented out in the workflow file until the bot is ready |
 
+Every comment the bot posts on Metaculus ends with a `RECORD` section: one line of JSON with the bot's commit, each lane's individual forecasts and costs, and the final forecast. Once questions resolve, this is what later analysis reads (for example "Claude only" against "GPT only" against the aggregate).
+
+In tournament mode the run log shows only warnings, errors, costs and question links. The logs of a public repository can be read by anyone, and forecasts on open tournament questions should stay private until the questions close. The full research and reasoning are in the bot's private comments on Metaculus.
+
 Every run that forecasts on something posts a short summary to Discord: how many forecasts were submitted, the estimated cost per lane and any failures.
 
 The tournament rules forbid previewing how a bot forecasts on open tournament questions, so `cirrus.py` refuses `--no-publish` in tournament mode. Test changes on the bot testing area instead.
