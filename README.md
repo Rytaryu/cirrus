@@ -23,6 +23,10 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
 | Forecast on new AI tournament questions | The live tournament and MiniBench. | Manual; the 20-minute schedule is commented out in the workflow file until the bot is ready |
 
+Every run that forecasts on something posts a short summary to Discord: how many forecasts were submitted, the estimated cost per lane and any failures.
+
+The tournament rules forbid previewing how a bot forecasts on open tournament questions, so `cirrus.py` refuses `--no-publish` in tournament mode. Test changes on the bot testing area instead.
+
 Repository secrets used: `METACULUS_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and, optionally, `DISCORD_WEBHOOK_URL`. A lane whose key is missing is skipped.
 
 Locally:
