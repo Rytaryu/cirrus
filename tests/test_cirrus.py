@@ -225,7 +225,7 @@ class CirrusTests(unittest.TestCase):
         finally:
             os.environ["OPENAI_API_KEY"] = saved
 
-    def test_cost_cap_stops_further_forecasts(self) -> None:
+    def test_cost_cap_stops_forecasts_when_research_is_too_expensive(self) -> None:
         original = cirrus.LANE_COST_CAP_USD
         cirrus.LANE_COST_CAP_USD = 0.000001  # research alone exceeds this
         try:
@@ -233,7 +233,59 @@ class CirrusTests(unittest.TestCase):
         finally:
             cirrus.LANE_COST_CAP_USD = original
         self.assertIsInstance(reports[0], BaseException)
+        self.assertIn("LaneCostCapReached", str(reports[0]))
         self.assertFalse(any("interviewing for a job" in json.dumps(body) for _, body in REQUESTS))
+
+    def test_costs_are_split_by_role(self) -> None:
+        bot, _ = forecast([make_question(1)])
+        for name in ("claude", "gpt"):
+            stats = bot.lane_stats[name]
+            self.assertGreater(stats.research_cost, 0)
+            self.assertGreater(stats.forecast_cost, 0)
+            self.assertGreater(stats.summary_cost, 0)
+            parts = stats.research_cost + stats.forecast_cost + stats.summary_cost
+            self.assertAlmostEqual(parts, sum(stats.costs), places=6)
+        self.assertIn("per question: research $", bot.lane_report())
+
+    def test_reported_cost_matches_token_prices(self) -> None:
+        # Prices in USD per token (input, output), from the providers' price lists.
+        sonnet, opus, haiku = (2e-6, 1e-5), (4e-6, 2e-5), (1e-7, 5e-7)
+        sol, luna = (2e-6, 1e-5), (1e-7, 5e-7)
+        search = 0.01  # one web search
+        forecasts = cirrus.PREDICTIONS_PER_LANE
+        parses = forecasts * 2  # each forecast is parsed twice for validation
+
+        def cost(price: tuple[float, float], tokens_in: int, tokens_out: int) -> float:
+            return price[0] * tokens_in + price[1] * tokens_out
+
+        # Token counts are the ones FakeProviders returns.
+        claude = (
+            cost(sonnet, 9000, 400) + search
+            + cost(haiku, 600, 30)
+            + forecasts * cost(opus, 3000, 800)
+            + parses * cost(haiku, 900, 20)
+        )
+        gpt = (
+            cost(sol, 3000, 500) + search
+            + cost(luna, 3000, 500)
+            + forecasts * cost(sol, 3000, 500)
+            + parses * cost(luna, 3000, 500)
+        )
+        bot, reports = forecast([make_question(1)])
+        self.assertAlmostEqual(sum(bot.lane_stats["claude"].costs), claude, places=6)
+        self.assertAlmostEqual(sum(bot.lane_stats["gpt"].costs), gpt, places=6)
+        self.assertAlmostEqual(reports[0].price_estimate, claude + gpt, places=6)
+
+    def test_pick_sample_prefers_different_question_types(self) -> None:
+        class Numeric(BinaryQuestion):
+            pass
+
+        binary = [make_question(n) for n in (1, 2, 3)]
+        numeric = [Numeric(**make_question(n).model_dump()) for n in (4, 5)]
+        picked = cirrus.pick_sample(binary + numeric, 3)
+        self.assertEqual([q.id_of_post for q in picked], [1, 4, 2])
+        self.assertEqual(len(cirrus.pick_sample(binary, 0)), 3)
+        self.assertEqual(len(cirrus.pick_sample(binary, 10)), 3)
 
     def test_scrub_hides_key_like_strings(self) -> None:
         cleaned = cirrus.scrub("Incorrect API key provided: sk-proj-abcdEFGH12345678\nnext line")
