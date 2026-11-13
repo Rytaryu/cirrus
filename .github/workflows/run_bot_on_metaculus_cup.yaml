@@ -1,22 +1,24 @@
 name: Forecast on Metaculus Cup
 
+# Manual only. Bots win no prizes in the Metaculus Cup, so this is used as a
+# rehearsal on real questions; it can be re-run without penalty.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
 
-# Add concurrency group to prevent parallel runs
+# The job token is only used to check out this public repository.
+permissions:
+  contents: read
+
+# Never run two copies of this workflow at the same time.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-
-# Daily job to run the simple forecast bot
 jobs:
   forecast_job:
-    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    steps: # sets up the steps that will be run in order
-      # setup repository with all necessary dependencies - keep as is
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
       - name: Check out repository
         uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,16 +31,23 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
       - name: Run bot
-        run: |
-          uv run python main.py --mode metaculus_cup
-        # this reads the environment variables from the github repository.
-        # Store under Settings --> Secrets and variables --> Actions
+        timeout-minutes: 40
+        run: uv run python cirrus.py --mode metaculus_cup
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
-          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set; skipping the notification."
+            exit 0
+          fi
+          payload=$(jq -n --arg content "cirrus: \"$WORKFLOW_NAME\" failed. $RUN_URL" '{content: $content}')
+          curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" > /dev/null
