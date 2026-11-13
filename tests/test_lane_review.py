@@ -128,6 +128,8 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(first["lanes"]["gpt"]["score"], 0.0)
         self.assertAlmostEqual(first["final"]["score"], 48.54, places=2)
         self.assertEqual(first["commit"], "abc1234")
+        self.assertEqual(first["lanes"]["claude"]["forecast"], 0.85)
+        self.assertEqual(first["final"]["forecast"], 0.7)
 
     def test_summary_counts_and_compares_on_shared_questions(self) -> None:
         summary = lane_review.summarize(self.rows())

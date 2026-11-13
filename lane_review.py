@@ -186,9 +186,26 @@ def _judge(prediction: Any, resolution: str | None, question_type: str | None) -
     if question_type in CONTINUOUS_TYPES:
         forecasts = prediction if _is_list_of_forecasts(prediction) else [prediction]
         hits = [hit for hit in (interval_hit(f, resolution) for f in forecasts) if hit]
-        return {"score": None, "hits": [[hit, round(nominal, 4)] for hit, nominal in hits]}
+        return {
+            "score": None,
+            "forecast": None,
+            "hits": [[hit, round(nominal, 4)] for hit, nominal in hits],
+        }
     score = baseline_score(prediction, resolution, question_type)
-    return {"score": None if score is None else round(score, 2), "hits": []}
+    return {
+        "score": None if score is None else round(score, 2),
+        "forecast": _rounded(prediction),
+        "hits": [],
+    }
+
+
+def _rounded(prediction: Any) -> Any:
+    """A binary or multiple choice forecast, rounded for the saved rows."""
+    if isinstance(prediction, (int, float)) and not isinstance(prediction, bool):
+        return round(prediction, 4)
+    if isinstance(prediction, dict):
+        return {option: round(value, 4) for option, value in prediction.items()}
+    return None
 
 
 def _is_list_of_forecasts(prediction: Any) -> bool:
