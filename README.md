@@ -29,6 +29,16 @@ In tournament mode the run log shows only warnings, errors, costs and question l
 
 Every run that forecasts on something posts a short summary to Discord: how many forecasts were submitted, the estimated cost per lane and any failures.
 
+### Comparing the lanes
+
+`lane_review.py` reads those records back for questions that have resolved and scores each lane on its own next to the submitted aggregate:
+
+```bash
+uv run --group integrations python lane_review.py --resolved-since 30 --output lane-review.json --summary lane-review.md
+```
+
+It is read-only and only ever lists resolved questions. With `METACULUS_TOKEN` unset (or set to `placeholder`) it sends no `Authorization` header and expects the network to add one, which is how a network secret in a Claude cloud environment works. `python lane_review.py --check` tests access, and `python lane_review.py bot-review ...` runs the stock review tool with the same authentication, limited to resolved questions.
+
 The tournament rules forbid previewing how a bot forecasts on open tournament questions, so `cirrus.py` refuses `--no-publish` in tournament mode. Test changes on the bot testing area instead.
 
 Repository secrets used: `METACULUS_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and, optionally, `DISCORD_WEBHOOK_URL`. A lane whose key is missing is skipped.
