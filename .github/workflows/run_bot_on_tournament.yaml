@@ -4,25 +4,50 @@ name: Forecast on new AI tournament questions
 # MiniBench. Questions are open for about 3 hours, and a question that already
 # has a forecast is skipped, so each question is forecast once.
 #
+# GitHub's schedule cannot be relied on to start a run every 20 minutes: from
+# 13 to 17 November 2026 it started 15 runs instead of about 280, with gaps of
+# 4 to 10 hours, and the bot missed most MiniBench questions. So a run keeps
+# going by itself: it looks for new questions every POLL_MINUTES for about
+# LOOP_MINUTES, then starts the next run and ends. The schedule below is only
+# a backup that restarts this chain if it ever breaks.
+#
+# Runs never overlap (see concurrency): a run started while another is going
+# waits, and only the newest waiting run is kept. Backup runs that fire while
+# the chain is alive are therefore cancelled; that is expected.
+#
 # To pause the bot: Actions tab -> this workflow -> "..." -> Disable workflow.
+# The run in progress stops within POLL_MINUTES and does not start another.
+# To stop at once, also cancel that run.
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour
+    - cron: "7,27,47 * * * *" # backup only, see above
 
-# The job token is only used to check out this public repository.
+# The job token checks out this public repository, reads whether this
+# workflow is disabled, and starts the next run.
 permissions:
   contents: read
+  actions: write
 
 # Never run two copies of this workflow at the same time.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
+env:
+  WORKFLOW_FILE: run_bot_on_tournament.yaml
+  POLL_MINUTES: 15
+  # Attempts start up to LOOP_MINUTES after the loop starts and may take up to
+  # ATTEMPT_TIMEOUT_MINUTES, which must fit in the loop step's timeout below.
+  LOOP_MINUTES: 290
+  ATTEMPT_TIMEOUT_MINUTES: 40
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 jobs:
   forecast_job:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # GitHub-hosted jobs may run for at most 6 hours.
+    timeout-minutes: 355
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -35,24 +60,30 @@ jobs:
           version: "0.13.1"
       - name: Install dependencies
         run: uv sync --locked
-      - name: Run bot
-        timeout-minutes: 40
-        run: uv run python cirrus.py --mode tournament
+      - name: Forecast on new questions every 15 minutes
+        id: loop
+        timeout-minutes: 340
+        run: bash .github/scripts/forecast_loop.sh
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      - name: Notify Discord on failure
-        if: failure()
+          GH_TOKEN: ${{ github.token }}
+      # Also after failed attempts, so that the bot keeps trying. Not when the
+      # run was cancelled by hand, and not when the setup above failed (that
+      # would start a new run every minute until someone notices).
+      - name: Start the next run
+        if: ${{ !cancelled() && steps.loop.outcome != 'skipped' }}
+        run: bash .github/scripts/start_next_run.sh
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          WORKFLOW_NAME: ${{ github.workflow }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+      # Failed attempts are reported from inside the loop; this covers the setup
+      # steps and starting the next run.
+      - name: Notify Discord on failure
+        if: ${{ failure() && steps.loop.outcome != 'failure' }}
         run: |
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-            echo "DISCORD_WEBHOOK_URL is not set; skipping the notification."
-            exit 0
-          fi
-          payload=$(jq -n --arg content "cirrus: \"$WORKFLOW_NAME\" failed. $RUN_URL" '{content: $content}')
-          curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" > /dev/null
+          bash .github/scripts/notify_discord.sh "cirrus: \"$WORKFLOW_NAME\" failed outside the forecasting loop. $RUN_URL"
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

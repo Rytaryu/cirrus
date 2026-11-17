@@ -132,6 +132,28 @@ def make_question(number: int) -> BinaryQuestion:
     )
 
 
+def closed_question_error() -> Exception:
+    """What Metaculus answered on 2026-11-17 to a forecast on a question that had just closed."""
+    import requests
+
+    return requests.exceptions.HTTPError(
+        "HTTPError. Url: https://www.metaculus.com/api/questions/forecast/. Status code: 405. "
+        "Response reason: Method Not Allowed. Response text: "
+        '{"error":"Question 46866 is already closed to forecasting !"}.'
+    )
+
+
+def template_error(bot, number: int, error: Exception) -> BaseException:
+    """The error as the template hands it back for one question in a run."""
+    try:
+        bot._reraise_exception_with_prepended_message(
+            error, f"Error while processing question url: 'https://example.com/q/{number}'"
+        )
+    except BaseException as wrapped:  # noqa: BLE001
+        return wrapped
+    raise AssertionError("the template did not raise")
+
+
 def forecast(questions: list[BinaryQuestion], **bot_kwargs):
     bot = cirrus.Cirrus(
         publish_reports_to_metaculus=False,
@@ -306,6 +328,40 @@ class CirrusTests(unittest.TestCase):
     def test_run_message_is_empty_when_nothing_happened(self) -> None:
         bot, reports = forecast([])
         self.assertIsNone(bot.run_message("tournament", reports, published=True))
+
+    def test_question_closed_before_submission_is_recognised(self) -> None:
+        bot, _ = forecast([])
+        closed = template_error(bot, 2, closed_question_error())
+        other = template_error(bot, 3, RuntimeError("HTTPError. Status code: 500. Response text: oops"))
+        # Only the cause carries Metaculus's message.
+        wrapped = RuntimeError("Error while processing question url: 'https://example.com/q/4'")
+        wrapped.__cause__ = closed_question_error()
+
+        self.assertTrue(cirrus.closed_before_submission(closed))
+        self.assertTrue(cirrus.closed_before_submission(wrapped))
+        self.assertTrue(cirrus.closed_before_submission(ExceptionGroup("2 errors", [closed, wrapped])))
+        # A real failure next to a closed question is still a failure.
+        self.assertFalse(cirrus.closed_before_submission(ExceptionGroup("2 errors", [other, closed])))
+        self.assertFalse(cirrus.closed_before_submission(other))
+        self.assertEqual(cirrus.question_url_of(closed), "https://example.com/q/2")
+
+        found, rest = cirrus.split_closed(["report", closed, other, wrapped])
+        self.assertEqual(found, [closed, wrapped])
+        self.assertEqual(rest, ["report", other])
+
+    def test_run_message_lists_questions_that_closed_before_submission(self) -> None:
+        bot, reports = forecast([make_question(1)])
+        closed = [template_error(bot, 2, closed_question_error())]
+        message = bot.run_message("tournament", reports, published=True, closed=closed)
+        self.assertIn("submitted 1 forecast(s), 0 question(s) failed", message)
+        self.assertIn(
+            "Missed 1 question(s) that closed before the forecast could be submitted: "
+            "<https://example.com/q/2>",
+            message,
+        )
+
+        empty_bot, nothing = forecast([])
+        self.assertIsNotNone(empty_bot.run_message("tournament", nothing, published=True, closed=closed))
 
     def test_tournament_mode_refuses_dry_runs(self) -> None:
         with self.assertRaises(SystemExit):

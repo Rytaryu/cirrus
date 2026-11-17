@@ -370,6 +370,51 @@ def github_run_url() -> str | None:
     return None
 
 
+# Metaculus answers a forecast on a closed question with HTTP 405 and
+# {"error": "Question ... is already closed to forecasting !"}.
+_CLOSED_TO_FORECASTING = "closed to forecasting"
+_QUESTION_URL_IN_ERROR = re.compile(r"question url: '([^']+)'")
+
+
+def closed_before_submission(error: BaseException) -> bool:
+    """
+    True when Metaculus refused the forecast because the question closed while
+    the bot was still working on it. The question was open when the run fetched
+    it, so this is a deadline the run missed, not a bug in the bot.
+
+    The error itself or the errors it was raised from (__cause__) must say so.
+    An exception group counts only if every error in it does, so that a real
+    failure is never hidden behind a closed question.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _CLOSED_TO_FORECASTING in str(current).lower():
+            return True
+        if isinstance(current, BaseExceptionGroup) and current.exceptions:
+            return all(closed_before_submission(inner) for inner in current.exceptions)
+        current = current.__cause__
+    return False
+
+
+def split_closed(reports: list) -> tuple[list, list]:
+    """
+    Split a run's reports into (closed, rest): `closed` holds the errors for
+    questions that closed before the forecast could be submitted, `rest`
+    holds everything else in the original order.
+    """
+    closed = [r for r in reports if isinstance(r, BaseException) and closed_before_submission(r)]
+    rest = [r for r in reports if not any(r is c for c in closed)]
+    return closed, rest
+
+
+def question_url_of(error: BaseException) -> str | None:
+    """The question link the template puts in its per-question error message."""
+    match = _QUESTION_URL_IN_ERROR.search(str(error))
+    return match.group(1) if match else None
+
+
 # =============================================================================
 # THE BOT
 # =============================================================================
@@ -638,19 +683,30 @@ class Cirrus(FallTemplateBot2026):
             )
         return "\n".join(lines)
 
-    def run_message(self, run_mode: str, reports: list, published: bool) -> str | None:
+    def run_message(
+        self, run_mode: str, reports: list, published: bool, closed: list | None = None
+    ) -> str | None:
         """
-        The Discord message for one run: what was submitted, what it cost and
-        what failed. None when the run had nothing to forecast.
+        The Discord message for one run: what was submitted, what it cost, what
+        failed and which questions closed before their forecast could be
+        submitted (`closed`, see split_closed). None when the run had nothing
+        to forecast.
         """
+        closed = closed or []
         done = [r for r in reports if isinstance(r, ForecastReport)]
         failed = [r for r in reports if isinstance(r, BaseException)]
         lane_failures = {n: s.failures for n, s in self.lane_stats.items() if s.failures}
-        if not done and not failed and not lane_failures:
+        if not done and not failed and not closed and not lane_failures:
             return None
 
         verb = "submitted" if published else "produced without submitting"
         lines = [f"cirrus ({run_mode}): {verb} {len(done)} forecast(s), {len(failed)} question(s) failed."]
+        if closed:
+            urls = [question_url_of(error) or "(link unknown)" for error in closed]
+            lines.append(
+                f"Missed {len(closed)} question(s) that closed before the forecast "
+                "could be submitted: " + ", ".join(f"<{url}>" for url in urls)
+            )
         costs = [
             f"{name} ${sum(stats.costs):.2f}"
             for name, stats in self.lane_stats.items()
@@ -673,8 +729,10 @@ class Cirrus(FallTemplateBot2026):
             lines.append(f"Run: <{run_url}>")
         return "\n".join(lines)
 
-    def notify_run(self, run_mode: str, reports: list, published: bool) -> None:
-        message = self.run_message(run_mode, reports, published)
+    def notify_run(
+        self, run_mode: str, reports: list, published: bool, closed: list | None = None
+    ) -> None:
+        message = self.run_message(run_mode, reports, published, closed)
         if message:
             notify_discord(message)
 
@@ -823,14 +881,19 @@ def main() -> None:
     # One event loop for the whole run: the bot's semaphore and the provider
     # clients must not be shared between loops.
     forecast_reports = asyncio.run(run(bot, run_mode, args.max_questions))
+    # A question that closed while the bot was still forecasting it is a missed
+    # deadline, not a failure: it is reported but does not fail the run.
+    closed, forecast_reports = split_closed(forecast_reports)
 
     print(bot.lane_report())
-    bot.notify_run(run_mode, forecast_reports, publish_to_metaculus)
+    bot.notify_run(run_mode, forecast_reports, publish_to_metaculus, closed)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    for error in closed:
+        print(f"⏰  Closed before the forecast was submitted: {question_url_of(error) or error}")
     # Raises (and so fails the workflow run) if any question failed outright.
     bot.log_report_summary(forecast_reports)
 
