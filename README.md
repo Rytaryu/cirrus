@@ -21,13 +21,15 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 | --- | --- | --- |
 | Test Bot | Forecasts on the unscored [bot testing area](https://www.metaculus.com/tournament/bot-testing-area/). Choose the lanes, how many questions (3 by default) and whether to submit. | Manual |
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
-| Forecast on new AI tournament questions | The live tournament and MiniBench. Prize-eligible. | Every 20 minutes. Pause it with "Disable workflow" in the Actions tab |
+| Forecast on new AI tournament questions | The live tournament and MiniBench. Prize-eligible. | Always on: looks for new questions every 15 minutes (see below). Pause it with "Disable workflow" in the Actions tab |
 
 Every comment the bot posts on Metaculus ends with a `RECORD` section: one line of JSON with the bot's commit, each lane's individual forecasts and costs, and the final forecast. Once questions resolve, this is what later analysis reads (for example "Claude only" against "GPT only" against the aggregate).
 
 In tournament mode the run log shows only warnings, errors, costs and question links. The logs of a public repository can be read by anyone, and forecasts on open tournament questions should stay private until the questions close. The full research and reasoning are in the bot's private comments on Metaculus.
 
-Every run that forecasts on something posts a short summary to Discord: how many forecasts were submitted, the estimated cost per lane and any failures.
+Every run that forecasts on something posts a short summary to Discord: how many forecasts were submitted, the estimated cost per lane any failures, and any question that closed before its forecast could be submitted (that one does not count as a failure).
+
+Tournament questions are open for only 3 hours, and GitHub's schedule turned out to be far too unreliable for that: in its first days it started a run every 4 to 10 hours instead of every 20 minutes, and the bot missed most MiniBench questions. So the tournament workflow keeps itself going. Each run looks for new questions every 15 minutes for about 5 hours, then starts the next run and ends; the schedule only restarts this chain if it ever breaks. Backup runs that fire while a run is going show up as cancelled, which is expected. A failed attempt is reported to Discord once, and again when forecasting works again. Disabling the workflow stops the run in progress within 15 minutes.
 
 ### Comparing the lanes
 
@@ -112,7 +114,7 @@ Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional s
 ## Changing the Github automation
 To run a different script under the same workflows, edit the `uv run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
 - `test_bot.yaml` — manual-trigger smoke test against the bot-testing-area tournament.
-- `run_bot_on_tournament.yaml` — every 20 min on the live AIB tournament + MiniBench.
+- `run_bot_on_tournament.yaml` — always on (checks every 15 min) on the live AIB tournament + MiniBench.
 - `run_bot_on_metaculus_cup.yaml` — every 2 days on the Metaculus Cup.
 
 **To run `main_with_no_framework.py` via GitHub Actions instead of `main.py`:** open the workflow file you want and change `uv run python main.py` to `uv run python main_with_no_framework.py`. That's the only change required.
