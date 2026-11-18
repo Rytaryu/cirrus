@@ -235,6 +235,9 @@ def score_question(outcome: dict, record: dict | None) -> dict:
         "resolution": resolution,
         "spot_peer_score": outcome.get("spot_peer_score"),
         "commit": record.get("commit") if record else None,
+        # Record version 1 had no design field: each lane forecast from its own
+        # research. "pooled": every forecaster read every lane's research.
+        "design": record.get("design", "separate") if record else None,
         "lanes": {},
         "final": None,
     }
@@ -323,6 +326,7 @@ def summarize(rows: list[dict]) -> dict:
         "with_record": sum(1 for row in rows if row["final"] is not None),
         "by_type": dict(_count(row["type"] for row in rows)),
         "by_commit": dict(_count(row["commit"] for row in rows if row["commit"])),
+        "by_design": dict(_count(row.get("design") for row in rows if row.get("design"))),
         "lanes": lanes,
         "final": {
             "scored": len(final_scores),
@@ -357,6 +361,7 @@ def render(summary: dict, rows: list[dict], title: str) -> str:
         f"{summary['questions']} resolved questions, {summary['with_record']} with a "
         f"cirrus record. Types: {summary['by_type'] or '-'}. "
         f"Bot versions: {summary['by_commit'] or '-'}.",
+        f"Designs: {summary.get('by_design') or '-'} (separate: each lane forecast from its own research; pooled: every forecaster read all research).",
         "",
         "Score is the baseline score on binary and multiple choice questions "
         "(0 = uniform guess, 100 = perfect). Ranges are continuous questions: how "
@@ -524,6 +529,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--from-json", metavar="FILE", help="re-render rows saved with --output")
     parser.add_argument("--output", help="write the scored rows and summary to this json file")
     parser.add_argument("--summary", help="write the markdown report to this file")
+    parser.add_argument("--design", choices=["separate", "pooled"],
+                        help="only score questions whose record has this design "
+                        "(the bot switched from separate to pooled on 2026-11-18)")
     parser.add_argument("--max-comments", type=int, default=DEFAULT_MAX_COMMENTS)
     parser.add_argument("--seconds-between-requests", type=float, default=0.7)
     return parser.parse_args(argv)
@@ -547,6 +555,9 @@ def main(argv: list[str] | None = None) -> int:
             return check_access()
         rows = fetch_rows(args.resolved_since, args.max_comments, args.seconds_between_requests)
         title = f"questions resolved in the last {args.resolved_since} days"
+    if args.design:
+        rows = [row for row in rows if row.get("design") == args.design]
+        title += f", {args.design} design only"
     summary = summarize(rows)
     report = render(summary, rows, title)
     print(report)

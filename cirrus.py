@@ -162,27 +162,64 @@ class ResponsesLlm(GeneralLlm):
 # CONFIGURATION
 # =============================================================================
 
-# Forecasts each lane makes per question. With two lanes this gives 2 x 2 = 4
-# forecasts per question. Both lanes always make the same number, so neither
-# provider outweighs the other in the median.
-PREDICTIONS_PER_LANE = 2
+# How a question is handled: every lane's researcher searches the web on its
+# own, then every lane's forecaster reads all of the research reports together
+# and forecasts. Each forecast therefore draws on two independent sources, and
+# the forecasters differ only in the model that weighs the evidence.
+#
+# BUDGET. Each provider's API credits come with a subscription, about $100 a
+# month. Production may use $80 of it; the rest is kept for test runs, later
+# experiments and months with more questions than planned. Planning for 300
+# questions a month (the seasonal tournament and MiniBench together) leaves
+# $0.27 per provider per question on average: about $0.05 for its forecast and
+# the rest for its research. The settings below aim at that average, not at a
+# margin under it; single questions may cost much more.
+#
+# Research cost per question, measured on 4 bot-testing-area questions
+# (2026-11-18; the forecast from both reports adds about $0.04 for Claude and
+# $0.055 for GPT, the summary $0.002):
+#   claude  5 searches, effort high    $0.183
+#           7 searches, effort high    $0.205  <- used (one question: $0.44)
+#           5 searches, effort xhigh   $0.265  (lane over budget)
+#   gpt     effort medium              $0.149
+#           effort high                $0.220  <- used
+# Expected per question: claude about $0.25, gpt about $0.275.
 
-# Safety stop, in USD, per lane per question. If a lane's research alone costs
-# more than this, the lane makes no forecasts for that question and the other
-# lane carries it. The target is about $0.20 per lane per question; this stop
-# only catches runaway cases.
-LANE_COST_CAP_USD = 0.50
+# Forecasts each lane's forecaster makes per question. With two lanes and 1,
+# each question gets 2 forecasts, one per provider, so neither outweighs the
+# other in the aggregate (the median, which for two values is their mean).
+PREDICTIONS_PER_LANE = 1
 
-# How many questions' research may run at the same time.
+# Safety stop, in USD, per provider per question. If a lane's research costs
+# more than this, its forecaster sits the question out and the other lane's
+# forecast is submitted alone. By then the research is already paid for, so
+# the stop saves only the forecast; the budget is kept by the averages above
+# and by the per-call limits (searches, max tokens). It is set well above
+# normal hard questions (up to $0.44 measured) to catch only runaway cases.
+LANE_COST_CAP_USD = 1.00
+
+# How many research calls (one per lane per question) may run at the same time.
 MAX_CONCURRENT_RESEARCH = 4
 
 # Reasoning effort of the GPT forecaster: low, medium, high, xhigh or max.
 GPT_FORECAST_EFFORT = "medium"
 
+# Reasoning effort of the GPT researcher. More effort lets it plan its searches
+# and look again for what is still missing. Reasoning tokens are billed as output.
+GPT_RESEARCH_EFFORT = "high"
+
+# How much page content each GPT web search returns: low, medium or high.
+GPT_SEARCH_CONTEXT = "high"
+
 # Web searches the Claude researcher may run per question. Search results are
 # billed as input tokens and are re-read on every later step, so this is the
 # main driver of the Claude lane's cost.
-CLAUDE_MAX_SEARCHES = 3
+CLAUDE_MAX_SEARCHES = 7
+
+# Effort of the Claude researcher: low, medium, high, xhigh or max. Sonnet 5.5
+# always thinks adaptively, and effort sets how much (the API default is high).
+# Thinking tokens are billed as output and count against max_tokens.
+CLAUDE_RESEARCH_EFFORT = "high"
 
 
 @dataclass(frozen=True)
@@ -217,7 +254,8 @@ LANES: dict[str, Lane] = {
                     "max_uses": CLAUDE_MAX_SEARCHES,
                 }
             ],
-            max_tokens=6000,
+            output_config={"effort": CLAUDE_RESEARCH_EFFORT},
+            max_tokens=12000,
             timeout=300,
             allowed_tries=2,
         ),
@@ -242,11 +280,13 @@ LANES: dict[str, Lane] = {
         # GPT-6.1 Sol ($2 / $10) with OpenAI's web search tool ($10 per 1,000
         # calls; results are billed as input tokens). Web search needs the
         # Responses API, so every GPT call uses it.
+        # Reasoning tokens count against max_output_tokens, so it leaves room
+        # for them on top of the report.
         researcher=lambda: ResponsesLlm(
             model="openai/gpt-6.1-sol",
-            tools=[{"type": "web_search", "search_context_size": "medium"}],
-            reasoning={"effort": "low"},
-            max_output_tokens=6000,
+            tools=[{"type": "web_search", "search_context_size": GPT_SEARCH_CONTEXT}],
+            reasoning={"effort": GPT_RESEARCH_EFFORT},
+            max_output_tokens=12000,
             timeout=300,
             allowed_tries=2,
         ),
@@ -335,9 +375,10 @@ def build_llms(lanes: list[Lane]) -> dict[str, str | GeneralLlm | None]:
 _current_lane: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "cirrus_current_lane", default=None
 )
-# What the current lane has spent on the current question so far.
-_lane_spend: contextvars.ContextVar[MonetaryCostManager | None] = contextvars.ContextVar(
-    "cirrus_lane_spend", default=None
+# The question the current asyncio task is working on (its page URL), so that
+# costs can be added up per question and lane.
+_current_question: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "cirrus_current_question", default=None
 )
 
 
@@ -381,9 +422,14 @@ def notify_discord(message: str) -> None:
 # final forecast. Metaculus keeps the comments, so the full history of what
 # each lane predicted can be rebuilt from Metaculus alone once questions
 # resolve (for example to compare "Claude only", "GPT only" and the aggregate).
+#
+# Version 1 (until 2026-11-18): each lane forecast twice from its own research.
+# Version 2 ("design": "pooled"): each lane's forecaster forecasts once from
+# the research of all lanes, so a lane's predictions show its forecaster alone.
 
-RECORD_VERSION = 1
-_LANE_MARKER = re.compile(r"^\*Lane: (\w+)")
+RECORD_VERSION = 2
+RECORD_DESIGN = "pooled"
+_FORECASTER_MARKER = re.compile(r"^\*Forecaster: (\w+)")
 _MAX_RECORDED_PERCENTILES = 11
 
 
@@ -487,7 +533,8 @@ def question_url_of(error: BaseException) -> str | None:
 @dataclass
 class LaneStats:
     costs: list[float] = field(default_factory=list)  # one entry per question
-    failures: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)  # one entry per failed step
+    failed_questions: set[str] = field(default_factory=set)
     # Where the money went, summed over the run.
     research_cost: float = 0.0
     summary_cost: float = 0.0
@@ -496,11 +543,15 @@ class LaneStats:
 
 class Cirrus(FallTemplateBot2026):
     """
-    The template bot, run once per provider lane for every question.
+    The template bot with one research report built from every provider lane
+    and one forecaster per lane.
 
-    Forecast prompts and output parsing are inherited from the template. This
-    class adds the lanes, a research prompt written for web search, a per-lane
-    spending stop and per-lane cost reporting.
+    For each question, every lane's researcher searches the web at the same
+    time; their reports are joined into one research text, and every lane's
+    forecaster forecasts from all of it. Forecast prompts and output parsing
+    are inherited from the template. This class adds the lanes, a research
+    prompt written for web search, a per-lane spending stop and per-lane cost
+    reporting.
     """
 
     def __init__(self, *, lanes: list[Lane] | None = None, **kwargs) -> None:
@@ -510,8 +561,12 @@ class Cirrus(FallTemplateBot2026):
                 "No lane is available. Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY."
             )
         kwargs.setdefault("llms", build_llms(self.lanes))
-        kwargs.setdefault("research_reports_per_question", len(self.lanes))
-        kwargs.setdefault("predictions_per_research_report", PREDICTIONS_PER_LANE)
+        # One research text (made by all lanes together), forecast on by every
+        # lane's forecaster.
+        kwargs.setdefault("research_reports_per_question", 1)
+        kwargs.setdefault(
+            "predictions_per_research_report", len(self.lanes) * PREDICTIONS_PER_LANE
+        )
         # One lane failing leaves half of the forecasts. Allow the question to
         # go ahead as long as at least one forecast survives.
         kwargs.setdefault("required_successful_predictions", 0.0)
@@ -522,6 +577,8 @@ class Cirrus(FallTemplateBot2026):
         self._lane_turn: dict[int, int] = {}
         # question URL -> lane -> {"cost": ..., "error": ...}, for the record.
         self._lane_outcomes: dict[str, dict[str, dict]] = {}
+        # question URL -> lane -> cost kind -> USD spent on that question.
+        self._question_spend: dict[str, dict[str, dict[str, float]]] = {}
         self._research_limiter = asyncio.Semaphore(MAX_CONCURRENT_RESEARCH)
 
     @classmethod
@@ -557,84 +614,145 @@ class Cirrus(FallTemplateBot2026):
     async def _research_and_make_predictions(
         self, question: MetaculusQuestion
     ) -> ResearchWithPredictions:
-        lane = self._take_lane(question)
-        token = _current_lane.set(lane.name)
-        stats = self.lane_stats[lane.name]
-        outcome: dict = {}
-        self._lane_outcomes.setdefault(question.page_url, {})[lane.name] = outcome
+        """Research and forecasts for one question, with costs kept per lane."""
+        url = question.page_url
+        self._question_spend[url] = {
+            lane.name: {"research_cost": 0.0, "forecast_cost": 0.0, "summary_cost": 0.0}
+            for lane in self.lanes
+        }
+        outcomes = self._lane_outcomes.setdefault(url, {})
+        for lane in self.lanes:
+            outcomes.setdefault(lane.name, {})
+        token = _current_question.set(url)
         try:
-            # A limit of 0 means "track only"; the cap is checked in _make_prediction.
-            with MonetaryCostManager(0) as cost_manager:
-                spend_token = _lane_spend.set(cost_manager)
-                try:
-                    result = await super()._research_and_make_predictions(question)
-                finally:
-                    _lane_spend.reset(spend_token)
-                    stats.costs.append(cost_manager.current_usage)
-                    outcome["cost"] = round(cost_manager.current_usage, 4)
-                    logger.info(
-                        f"[{lane.name}] spent about ${cost_manager.current_usage:.4f} "
-                        f"on {question.page_url}"
-                    )
-        except Exception as error:
-            stats.failures.append(
-                f"{question.page_url}: {type(error).__name__}: {scrub(str(error))}"
-            )
-            outcome["error"] = type(error).__name__
-            logger.error(f"[{lane.name}] lane failed on {question.page_url}: {error}")
-            raise
+            return await super()._research_and_make_predictions(question)
         finally:
-            _current_lane.reset(token)
+            _current_question.reset(token)
+            for lane in self.lanes:
+                spend = self._question_spend[url][lane.name]
+                total = sum(spend.values())
+                self.lane_stats[lane.name].costs.append(total)
+                outcomes[lane.name]["cost"] = round(total, 4)
+                outcomes[lane.name]["research_cost"] = round(spend["research_cost"], 4)
+                logger.info(f"[{lane.name}] spent about ${total:.4f} on {url}")
 
-        models = (
-            f"research: {self.get_llm(f'{lane.name}/researcher', 'llm').model}, "
-            f"forecasts: {self.get_llm(f'{lane.name}/default', 'llm').model}"
-        )
-        result.research_report = (
-            f"*Lane: {lane.name} ({models})*\n\n{result.research_report}"
-        )
-        return result
+    def _lane_failed(
+        self, question: MetaculusQuestion, lane: Lane, stage: str, error: BaseException
+    ) -> None:
+        """Note a failed research or forecast step for the run summary and the record."""
+        url = question.page_url
+        stats = self.lane_stats[lane.name]
+        stats.failures.append(f"{url} ({stage}): {type(error).__name__}: {scrub(str(error))}")
+        stats.failed_questions.add(url)
+        outcome = self._lane_outcomes.setdefault(url, {}).setdefault(lane.name, {})
+        outcome.setdefault("error", f"{stage}: {type(error).__name__}")
+        logger.error(f"[{lane.name}] {stage} failed on {url}: {error}")
 
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
     ) -> ReasonedPrediction:
-        spend = _lane_spend.get()
-        if spend is not None and spend.current_usage >= LANE_COST_CAP_USD:
-            raise LaneCostCapReached(
-                f"Research cost about ${spend.current_usage:.2f}, which is over the "
-                f"${LANE_COST_CAP_USD:.2f} cap per lane per question."
+        """One forecast by the next lane's forecaster, from the joint research."""
+        lane = self._take_lane(question)
+        token = _current_lane.set(lane.name)
+        try:
+            spent = (
+                self._question_spend.get(question.page_url, {})
+                .get(lane.name, {})
+                .get("research_cost", 0.0)
             )
-        with MonetaryCostManager(0) as cost_manager:
-            try:
-                return await super()._make_prediction(question, research)
-            finally:
-                self._add_cost("forecast_cost", cost_manager.current_usage)
+            if spent >= LANE_COST_CAP_USD:
+                raise LaneCostCapReached(
+                    f"Research cost about ${spent:.2f}, which is over the "
+                    f"${LANE_COST_CAP_USD:.2f} cap per lane per question."
+                )
+            with MonetaryCostManager(0) as cost_manager:
+                try:
+                    prediction = await super()._make_prediction(question, research)
+                finally:
+                    self._add_cost("forecast_cost", cost_manager.current_usage)
+            model = self.get_llm("default", "llm").model
+            return prediction.model_copy(
+                update={
+                    "reasoning": f"*Forecaster: {lane.name} ({model})*\n\n{prediction.reasoning}"
+                }
+            )
+        except Exception as error:
+            self._lane_failed(question, lane, "forecast", error)
+            raise
+        finally:
+            _current_lane.reset(token)
 
     async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
-        with MonetaryCostManager(0) as cost_manager:
-            try:
-                return await super().summarize_research(question, research)
-            finally:
-                self._add_cost("summary_cost", cost_manager.current_usage)
+        # The summary only goes into the comment. It is written by the helper
+        # of the first lane whose research worked, and counted as that lane's.
+        outcomes = self._lane_outcomes.get(question.page_url, {})
+        lane = next(
+            (l for l in self.lanes if "error" not in outcomes.get(l.name, {})),
+            self.lanes[0],
+        )
+        token = _current_lane.set(lane.name)
+        try:
+            with MonetaryCostManager(0) as cost_manager:
+                try:
+                    return await super().summarize_research(question, research)
+                finally:
+                    self._add_cost("summary_cost", cost_manager.current_usage)
+        finally:
+            _current_lane.reset(token)
 
     def _add_cost(self, kind: str, amount: float) -> None:
         lane = _current_lane.get()
-        if lane in self.lane_stats:
-            stats = self.lane_stats[lane]
-            setattr(stats, kind, getattr(stats, kind) + amount)
+        if lane not in self.lane_stats:
+            return
+        stats = self.lane_stats[lane]
+        setattr(stats, kind, getattr(stats, kind) + amount)
+        url = _current_question.get()
+        if url in self._question_spend:
+            self._question_spend[url][lane][kind] += amount
 
     # --------------------------------------------------------------- research
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._research_limiter:
-            researcher = self.get_llm("researcher", "llm")
-            with MonetaryCostManager(0) as cost_manager:
-                try:
-                    research = await researcher.invoke(self._research_prompt(question))
-                finally:
-                    self._add_cost("research_cost", cost_manager.current_usage)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+        """Every lane researches at the same time; the reports are joined."""
+        results = await asyncio.gather(
+            *(self._lane_research(lane, question) for lane in self.lanes),
+            return_exceptions=True,
+        )
+        reports = []
+        errors = []
+        for lane, result in zip(self.lanes, results):
+            if isinstance(result, BaseException):
+                self._lane_failed(question, lane, "research", result)
+                errors.append(result)
+                continue
+            model = self.get_llm(f"{lane.name}/researcher", "llm").model
+            reports.append(f"# Research report from the {lane.name} lane ({model})\n\n{result}")
+        if not reports:
+            raise ExceptionGroup("Every lane's research failed", errors)  # type: ignore[arg-type]
+        if len(reports) == 1:
+            intro = "One research report follows; the other researcher failed on this question."
+        else:
+            intro = (
+                f"{len(reports)} research assistants searched the web independently; "
+                "their reports follow. They may repeat or contradict each other. Where "
+                "they disagree, prefer the more recent and better sourced fact."
+            )
+        return intro + "\n\n" + "\n\n".join(reports)
+
+    async def _lane_research(self, lane: Lane, question: MetaculusQuestion) -> str:
+        token = _current_lane.set(lane.name)
+        try:
+            async with self._research_limiter:
+                researcher = self.get_llm("researcher", "llm")
+                with MonetaryCostManager(0) as cost_manager:
+                    try:
+                        research = await researcher.invoke(self._research_prompt(question))
+                    finally:
+                        self._add_cost("research_cost", cost_manager.current_usage)
+            logger.info(f"[{lane.name}] Found research for URL {question.page_url}:\n{research}")
             return research
+        finally:
+            _current_lane.reset(token)
 
     @staticmethod
     def _research_prompt(question: MetaculusQuestion) -> str:
@@ -671,21 +789,25 @@ class Cirrus(FallTemplateBot2026):
         final_cost: float,
     ) -> dict:
         lanes: dict[str, dict] = {}
-        for name, outcome in self._lane_outcomes.get(question.page_url, {}).items():
+        outcomes = self._lane_outcomes.get(question.page_url, {})
+        for lane in self.lanes:
+            name = lane.name
             lanes[name] = {
                 "research_model": self.get_llm(f"{name}/researcher", "llm").model,
                 "forecast_model": self.get_llm(f"{name}/default", "llm").model,
                 "predictions": [],
-                **outcome,
+                **outcomes.get(name, {}),
             }
         for collection in research_prediction_collections:
-            marker = _LANE_MARKER.match(collection.research_report)
-            if marker and marker.group(1) in lanes:
-                lanes[marker.group(1)]["predictions"] = [
-                    compact_prediction(p.prediction_value) for p in collection.predictions
-                ]
+            for prediction in collection.predictions:
+                marker = _FORECASTER_MARKER.match(prediction.reasoning or "")
+                if marker and marker.group(1) in lanes:
+                    lanes[marker.group(1)]["predictions"].append(
+                        compact_prediction(prediction.prediction_value)
+                    )
         return {
             "cirrus_record": RECORD_VERSION,
+            "design": RECORD_DESIGN,
             "commit": bot_version(),
             "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "question": {
@@ -738,7 +860,8 @@ class Cirrus(FallTemplateBot2026):
             total = sum(stats.costs)
             lines.append(
                 f"  {name}: {attempts} question(s), about ${total:.4f} in total, "
-                f"${total / attempts:.4f} per question, {len(stats.failures)} failure(s)"
+                f"${total / attempts:.4f} per question, "
+                f"failed on {len(stats.failed_questions)} question(s)"
             )
             lines.append(
                 f"    per question: research ${stats.research_cost / attempts:.4f}, "
@@ -780,7 +903,8 @@ class Cirrus(FallTemplateBot2026):
             lines.append("Cost (estimate): " + ", ".join(costs))
         for name, failures in lane_failures.items():
             lines.append(
-                f"Lane {name} failed on {len(failures)} question(s). First error: {failures[0]}"
+                f"Lane {name} failed on {len(self.lane_stats[name].failed_questions)} "
+                f"question(s). First error: {failures[0]}"
             )
         # <...> keeps Discord from adding a preview card for every link.
         shown = 8

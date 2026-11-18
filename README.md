@@ -4,14 +4,21 @@ cirrus is a forecasting bot for the [Metaculus FutureEval](https://www.metaculus
 
 ## How it forecasts
 
-Every question is handled by two independent **lanes**, one per AI provider:
+Every question is handled by two **lanes**, one per AI provider:
 
-| Lane | Research (with the provider's web search) | Forecasts | Parsing and summaries |
+| Lane | Research (with the provider's web search) | Forecast | Parsing and summaries |
 | --- | --- | --- | --- |
-| `claude` | Claude Sonnet 5.5 | Claude Opus 5.5, 2 per question | Claude Haiku 5.5 |
-| `gpt` | GPT-6.1 Sol | GPT-6.2 Astra, 2 per question | GPT-6 Luna |
+| `claude` | Claude Sonnet 5.5, effort high, up to 7 searches | Claude Opus 5.5, 1 per question | Claude Haiku 5.5 |
+| `gpt` | GPT-6.1 Sol, reasoning high, high search context | GPT-6.2 Astra, 1 per question | GPT-6 Luna |
 
-A lane's forecasters only see that lane's research. The four forecasts are then combined by the template's aggregation (the median for binary questions). If one lane fails, for example because its API credits ran out, the other lane's forecasts are still submitted and a notice goes to Discord.
+1. Both researchers search the web at the same time, each on its own.
+2. Their two reports are joined into one research text.
+3. Each forecaster reads all of it and forecasts once.
+4. The two forecasts are combined by the template's aggregation (the median, which for two forecasts is their mean).
+
+So every forecast draws on two independent sources, and the two forecasts differ only in the model that weighs the evidence. If one lane fails, for example because its API credits ran out, the other lane's forecaster still forecasts from the research that worked, and a notice goes to Discord.
+
+**Budget.** Each provider's API credits come with a subscription, about $100 a month; production may use $80 of each, planned for 300 questions a month, which is $0.27 per provider per question on average. The research settings are chosen to use that average, measured on test questions: Claude about $0.25 and GPT about $0.275 per question, most of it research; a hard question can cost much more. A lane whose research costs more than $1.00 on one question sits that question out (`LANE_COST_CAP_USD`), which only catches runaway cases.
 
 The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFIGURATION` section. `main.py` is the unmodified template, which `cirrus.py` builds on.
 
@@ -23,7 +30,7 @@ The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFI
 | Forecast on Metaculus Cup | Rehearsal on real questions (bots win no prizes there). | Manual |
 | Forecast on new AI tournament questions | The live tournament and MiniBench. Prize-eligible. | Always on: looks for new questions every 15 minutes (see below). Pause it with "Disable workflow" in the Actions tab |
 
-Every comment the bot posts on Metaculus ends with a `RECORD` section: one line of JSON with the bot's commit, each lane's individual forecasts and costs, and the final forecast. Once questions resolve, this is what later analysis reads (for example "Claude only" against "GPT only" against the aggregate).
+Every comment the bot posts on Metaculus ends with a `RECORD` section: one line of JSON with the bot's commit, each lane's individual forecasts and costs, and the final forecast. Once questions resolve, this is what later analysis reads (for example "Claude only" against "GPT only" against the aggregate). Records from 18 November 2026 on are version 2 with `"design": "pooled"`: a lane's predictions there are its forecaster's, made from both lanes' research. Older records (version 1) hold two forecasts per lane, each made from that lane's own research.
 
 In tournament mode the run log shows only warnings, errors, costs and question links. The logs of a public repository can be read by anyone, and forecasts on open tournament questions should stay private until the questions close. The full research and reasoning are in the bot's private comments on Metaculus.
 
@@ -38,6 +45,8 @@ Tournament questions are open for only 3 hours, and GitHub's schedule turned out
 ```bash
 uv run --group integrations python lane_review.py --resolved-since 30 --output lane-review.json --summary lane-review.md
 ```
+
+The report counts questions per design; add `--design pooled` (or `separate`) to score only one of them.
 
 It is read-only and only ever lists resolved questions. With `METACULUS_TOKEN` unset (or set to `placeholder`) it sends no `Authorization` header and expects the network to add one, which is how a network secret in a Claude cloud environment works. `python lane_review.py --check` tests access, and `python lane_review.py bot-review ...` runs the stock review tool with the same authentication, limited to resolved questions.
 
