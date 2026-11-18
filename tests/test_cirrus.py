@@ -194,7 +194,7 @@ class CirrusTests(unittest.TestCase):
         self.assertIn(("/v1/messages", "claude-opus-5-5", "null"), seen)
         self.assertIn(("/v1/messages", "claude-haiku-5-5", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6.1-sol", gpt_search), seen)
-        self.assertIn(("/v1/responses", "gpt-6-astra", "null"), seen)
+        self.assertIn(("/v1/responses", "gpt-6.2-astra", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6-luna", "null"), seen)
 
     def test_each_lane_only_sees_its_own_research(self) -> None:
@@ -272,7 +272,7 @@ class CirrusTests(unittest.TestCase):
     def test_reported_cost_matches_token_prices(self) -> None:
         # Prices in USD per token (input, output), from the providers' price lists.
         sonnet, opus, haiku = (2e-6, 1e-5), (4e-6, 2e-5), (1e-7, 5e-7)
-        sol, astra, luna = (2e-6, 1e-5), (1e-5, 5e-5), (1e-7, 5e-7)
+        sol, astra, luna = (2e-6, 1e-5), (8e-6, 4e-5), (1e-7, 5e-7)
         search = 0.01  # one web search
         forecasts = cirrus.PREDICTIONS_PER_LANE
         parses = forecasts * 2  # each forecast is parsed twice for validation
@@ -297,6 +297,30 @@ class CirrusTests(unittest.TestCase):
         self.assertAlmostEqual(sum(bot.lane_stats["claude"].costs), claude, places=6)
         self.assertAlmostEqual(sum(bot.lane_stats["gpt"].costs), gpt, places=6)
         self.assertAlmostEqual(reports[0].price_estimate, claude + gpt, places=6)
+
+    def test_fallback_prices_fill_only_missing_models(self) -> None:
+        import litellm
+
+        saved = {name: litellm.model_cost.pop(name, None) for name in cirrus.FALLBACK_PRICES}
+        try:
+            # As after a failed download: litellm knows neither model.
+            self.assertEqual(sorted(cirrus.add_missing_prices()), sorted(cirrus.FALLBACK_PRICES))
+            astra = litellm.model_cost["gpt-6.2-astra"]
+            self.assertEqual(astra["litellm_provider"], "openai")
+            self.assertEqual((astra["input_cost_per_token"], astra["output_cost_per_token"]), (8e-6, 4e-5))
+            # Tiered prices of the copied model are not carried over.
+            self.assertNotIn("input_cost_per_token_above_272k_tokens", astra)
+            self.assertTrue(astra["supports_reasoning"])
+            cost = litellm.cost_per_token(
+                model="gpt-6.2-astra", prompt_tokens=1000, completion_tokens=100
+            )
+            self.assertAlmostEqual(sum(cost), 8e-6 * 1000 + 4e-5 * 100, places=9)
+            # Once litellm has a price, it is left alone.
+            self.assertEqual(cirrus.add_missing_prices(), [])
+        finally:
+            for name, entry in saved.items():
+                if entry is not None:
+                    litellm.register_model({name: entry})
 
     def test_pick_sample_prefers_different_question_types(self) -> None:
         class Numeric(BinaryQuestion):
