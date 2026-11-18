@@ -198,6 +198,8 @@ class CirrusTests(unittest.TestCase):
         self.assertIn(("/v1/responses", "gpt-6.1-sol", gpt_search), seen)
         self.assertIn(("/v1/responses", "gpt-6.2-astra", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6-luna", "null"), seen)
+        sonnet = next(body for _, body in REQUESTS if body["model"] == "claude-sonnet-5-5")
+        self.assertEqual(sonnet["output_config"], {"effort": cirrus.CLAUDE_RESEARCH_EFFORT})
         efforts = {body["model"]: body.get("reasoning") for path, body in REQUESTS if path == "/v1/responses"}
         self.assertEqual(efforts["gpt-6.1-sol"]["effort"], cirrus.GPT_RESEARCH_EFFORT)
         self.assertEqual(efforts["gpt-6.2-astra"]["effort"], cirrus.GPT_FORECAST_EFFORT)

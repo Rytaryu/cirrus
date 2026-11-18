@@ -8,8 +8,8 @@ Every question is handled by two **lanes**, one per AI provider:
 
 | Lane | Research (with the provider's web search) | Forecast | Parsing and summaries |
 | --- | --- | --- | --- |
-| `claude` | Claude Sonnet 5.5, up to 5 searches | Claude Opus 5.5, 1 per question | Claude Haiku 5.5 |
-| `gpt` | GPT-6.1 Sol, medium reasoning, high search context | GPT-6.2 Astra, 1 per question | GPT-6 Luna |
+| `claude` | Claude Sonnet 5.5, effort high, up to 7 searches | Claude Opus 5.5, 1 per question | Claude Haiku 5.5 |
+| `gpt` | GPT-6.1 Sol, reasoning high, high search context | GPT-6.2 Astra, 1 per question | GPT-6 Luna |
 
 1. Both researchers search the web at the same time, each on its own.
 2. Their two reports are joined into one research text.
@@ -18,7 +18,7 @@ Every question is handled by two **lanes**, one per AI provider:
 
 So every forecast draws on two independent sources, and the two forecasts differ only in the model that weighs the evidence. If one lane fails, for example because its API credits ran out, the other lane's forecaster still forecasts from the research that worked, and a notice goes to Discord.
 
-**Budget.** Each provider's API credits come with a subscription, about $100 a month; production may use $80 of each, planned for 300 questions a month, which is $0.27 per provider per question. Measured on test questions: Claude about $0.23 and GPT about $0.20 per question, most of it research. A lane whose research costs more than $0.33 on one question sits that question out (`LANE_COST_CAP_USD`).
+**Budget.** Each provider's API credits come with a subscription, about $100 a month; production may use $80 of each, planned for 300 questions a month, which is $0.27 per provider per question on average. The research settings are chosen to use that average, measured on test questions: Claude about $0.25 and GPT about $0.275 per question, most of it research; a hard question can cost much more. A lane whose research costs more than $1.00 on one question sits that question out (`LANE_COST_CAP_USD`), which only catches runaway cases.
 
 The code is in [`cirrus.py`](cirrus.py); the models and limits are in its `CONFIGURATION` section. `main.py` is the unmodified template, which `cirrus.py` builds on.
 

@@ -171,26 +171,32 @@ class ResponsesLlm(GeneralLlm):
 # month. Production may use $80 of it; the rest is kept for test runs, later
 # experiments and months with more questions than planned. Planning for 300
 # questions a month (the seasonal tournament and MiniBench together) leaves
-# $0.27 per provider per question: about $0.05 for its forecast and the rest
-# for its research.
+# $0.27 per provider per question on average: about $0.05 for its forecast and
+# the rest for its research. The settings below aim at that average, not at a
+# margin under it; single questions may cost much more.
 #
-# Measured with these settings on 4 bot-testing-area questions (2026-11-18):
-#   claude  $0.225 per question: research $0.183, forecast $0.041, summary $0.002
-#   gpt     $0.204 per question: research $0.149, forecast $0.055
-# GPT research at "high" effort cost $0.220 per question, which would take the
-# GPT lane to about $0.275, over budget, so it stays at "medium".
+# Research cost per question, measured on 4 bot-testing-area questions
+# (2026-11-18; the forecast from both reports adds about $0.04 for Claude and
+# $0.055 for GPT, the summary $0.002):
+#   claude  5 searches, effort high    $0.183
+#           7 searches, effort high    $0.205  <- used (one question: $0.44)
+#           5 searches, effort xhigh   $0.265  (lane over budget)
+#   gpt     effort medium              $0.149
+#           effort high                $0.220  <- used
+# Expected per question: claude about $0.25, gpt about $0.275.
 
 # Forecasts each lane's forecaster makes per question. With two lanes and 1,
 # each question gets 2 forecasts, one per provider, so neither outweighs the
 # other in the aggregate (the median, which for two values is their mean).
 PREDICTIONS_PER_LANE = 1
 
-# Safety stop, in USD, per provider per question: 1.5 times the research budget
-# of about $0.22. If a lane's research costs more than this, its forecaster
-# sits the question out and the other lane's forecast is submitted alone. It
-# only catches runaway cases; the most a lane's research cost on one question
-# in the measurement above was about $0.30.
-LANE_COST_CAP_USD = 0.33
+# Safety stop, in USD, per provider per question. If a lane's research costs
+# more than this, its forecaster sits the question out and the other lane's
+# forecast is submitted alone. By then the research is already paid for, so
+# the stop saves only the forecast; the budget is kept by the averages above
+# and by the per-call limits (searches, max tokens). It is set well above
+# normal hard questions (up to $0.44 measured) to catch only runaway cases.
+LANE_COST_CAP_USD = 1.00
 
 # How many research calls (one per lane per question) may run at the same time.
 MAX_CONCURRENT_RESEARCH = 4
@@ -208,12 +214,12 @@ GPT_SEARCH_CONTEXT = "high"
 # Web searches the Claude researcher may run per question. Search results are
 # billed as input tokens and are re-read on every later step, so this is the
 # main driver of the Claude lane's cost.
-CLAUDE_MAX_SEARCHES = 5
+CLAUDE_MAX_SEARCHES = 7
 
 # Effort of the Claude researcher: low, medium, high, xhigh or max. Sonnet 5.5
 # always thinks adaptively, and effort sets how much (the API default is high).
 # Thinking tokens are billed as output and count against max_tokens.
-CLAUDE_RESEARCH_EFFORT = "xhigh"
+CLAUDE_RESEARCH_EFFORT = "high"
 
 
 @dataclass(frozen=True)
