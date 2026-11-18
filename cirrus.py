@@ -173,17 +173,24 @@ class ResponsesLlm(GeneralLlm):
 # questions a month (the seasonal tournament and MiniBench together) leaves
 # $0.27 per provider per question: about $0.05 for its forecast and the rest
 # for its research.
+#
+# Measured with these settings on 4 bot-testing-area questions (2026-11-18):
+#   claude  $0.225 per question: research $0.183, forecast $0.041, summary $0.002
+#   gpt     $0.204 per question: research $0.149, forecast $0.055
+# GPT research at "high" effort cost $0.220 per question, which would take the
+# GPT lane to about $0.275, over budget, so it stays at "medium".
 
 # Forecasts each lane's forecaster makes per question. With two lanes and 1,
 # each question gets 2 forecasts, one per provider, so neither outweighs the
 # other in the aggregate (the median, which for two values is their mean).
 PREDICTIONS_PER_LANE = 1
 
-# Safety stop, in USD, per provider per question. If a lane's research costs
-# more than this, its forecaster sits the question out and the other lane's
-# forecast is submitted alone. The research budget is about $0.22, so this
-# only catches runaway cases.
-LANE_COST_CAP_USD = 0.50
+# Safety stop, in USD, per provider per question: 1.5 times the research budget
+# of about $0.22. If a lane's research costs more than this, its forecaster
+# sits the question out and the other lane's forecast is submitted alone. It
+# only catches runaway cases; the most a lane's research cost on one question
+# in the measurement above was about $0.30.
+LANE_COST_CAP_USD = 0.33
 
 # How many research calls (one per lane per question) may run at the same time.
 MAX_CONCURRENT_RESEARCH = 4
