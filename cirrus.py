@@ -200,7 +200,7 @@ GPT_FORECAST_EFFORT = "medium"
 
 # Reasoning effort of the GPT researcher. More effort lets it plan its searches
 # and look again for what is still missing. Reasoning tokens are billed as output.
-GPT_RESEARCH_EFFORT = "medium"
+GPT_RESEARCH_EFFORT = "high"
 
 # How much page content each GPT web search returns: low, medium or high.
 GPT_SEARCH_CONTEXT = "high"
@@ -208,7 +208,12 @@ GPT_SEARCH_CONTEXT = "high"
 # Web searches the Claude researcher may run per question. Search results are
 # billed as input tokens and are re-read on every later step, so this is the
 # main driver of the Claude lane's cost.
-CLAUDE_MAX_SEARCHES = 5
+CLAUDE_MAX_SEARCHES = 7
+
+# Effort of the Claude researcher: low, medium, high, xhigh or max. Sonnet 5.5
+# always thinks adaptively, and effort sets how much (the API default is high).
+# Thinking tokens are billed as output and count against max_tokens.
+CLAUDE_RESEARCH_EFFORT = "high"
 
 
 @dataclass(frozen=True)
@@ -243,7 +248,8 @@ LANES: dict[str, Lane] = {
                     "max_uses": CLAUDE_MAX_SEARCHES,
                 }
             ],
-            max_tokens=6000,
+            output_config={"effort": CLAUDE_RESEARCH_EFFORT},
+            max_tokens=12000,
             timeout=300,
             allowed_tries=2,
         ),
