@@ -174,11 +174,13 @@ class CirrusTests(unittest.TestCase):
     def test_both_lanes_are_aggregated(self) -> None:
         bot, reports = forecast([make_question(1), make_question(2)])
         for report in reports:
-            # Two Claude forecasts at 30% and two GPT forecasts at 50%.
+            # One Claude forecast at 30% and one GPT forecast at 50%.
             self.assertAlmostEqual(report.prediction, 0.40)
             self.assertEqual(report.errors, [])
-            self.assertIn("*Lane: claude", report.explanation)
-            self.assertIn("*Lane: gpt", report.explanation)
+            self.assertIn("Research report from the claude lane", report.explanation)
+            self.assertIn("Research report from the gpt lane", report.explanation)
+            self.assertIn("*Forecaster: claude (anthropic/claude-opus-5-5)*", report.explanation)
+            self.assertIn("*Forecaster: gpt (openai/gpt-6.2-astra)*", report.explanation)
             # The note written before the search is kept, not read as the answer.
             self.assertIn("Let me look that up.", report.explanation)
             self.assertIn("GPT RESEARCH", report.explanation)
@@ -189,39 +191,51 @@ class CirrusTests(unittest.TestCase):
         forecast([make_question(1)])
         seen = {(path, body["model"], json.dumps(body.get("tools"))) for path, body in REQUESTS}
         claude_search = json.dumps([{"type": "web_search_20250305", "name": "web_search", "max_uses": cirrus.CLAUDE_MAX_SEARCHES}])
-        gpt_search = json.dumps([{"type": "web_search", "search_context_size": "medium"}])
+        gpt_search = json.dumps([{"type": "web_search", "search_context_size": cirrus.GPT_SEARCH_CONTEXT}])
         self.assertIn(("/v1/messages", "claude-sonnet-5-5", claude_search), seen)
         self.assertIn(("/v1/messages", "claude-opus-5-5", "null"), seen)
         self.assertIn(("/v1/messages", "claude-haiku-5-5", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6.1-sol", gpt_search), seen)
         self.assertIn(("/v1/responses", "gpt-6.2-astra", "null"), seen)
         self.assertIn(("/v1/responses", "gpt-6-luna", "null"), seen)
+        efforts = {body["model"]: body.get("reasoning") for path, body in REQUESTS if path == "/v1/responses"}
+        self.assertEqual(efforts["gpt-6.1-sol"]["effort"], cirrus.GPT_RESEARCH_EFFORT)
+        self.assertEqual(efforts["gpt-6.2-astra"]["effort"], cirrus.GPT_FORECAST_EFFORT)
 
-    def test_each_lane_only_sees_its_own_research(self) -> None:
+    def test_every_forecaster_reads_every_lanes_research(self) -> None:
         forecast([make_question(1)])
         forecaster_calls = [(path, json.dumps(body)) for path, body in REQUESTS if "interviewing for a job" in json.dumps(body)]
         self.assertEqual(len(forecaster_calls), 2 * cirrus.PREDICTIONS_PER_LANE)
-        for path, flat in forecaster_calls:
-            self.assertNotIn("*Lane:", flat)
-            if "/messages" in path:
-                self.assertIn("CLAUDE RESEARCH", flat)
-                self.assertNotIn("GPT RESEARCH", flat)
-            else:
-                self.assertIn("GPT RESEARCH", flat)
-                self.assertNotIn("CLAUDE RESEARCH", flat)
+        self.assertEqual(sorted(path for path, _ in forecaster_calls), ["/v1/messages", "/v1/responses"])
+        for _, flat in forecaster_calls:
+            self.assertIn("CLAUDE RESEARCH", flat)
+            self.assertIn("GPT RESEARCH", flat)
+            self.assertIn("research assistants searched the web independently", flat)
+            self.assertNotIn("*Forecaster:", flat)
+        # Each lane researches once per question.
+        research_calls = [body["model"] for _, body in REQUESTS if body.get("tools")]
+        self.assertEqual(sorted(research_calls), ["claude-sonnet-5-5", "gpt-6.1-sol"])
 
     def test_gpt_lane_down_leaves_claude_forecast(self) -> None:
         DOWN["openai"] = True
         bot, reports = forecast([make_question(1)])
         self.assertAlmostEqual(reports[0].prediction, 0.30)
-        self.assertEqual(len(bot.lane_stats["gpt"].failures), 1)
+        self.assertEqual(len(bot.lane_stats["gpt"].failed_questions), 1)
         self.assertEqual(bot.lane_stats["claude"].failures, [])
+        # Claude's forecaster still forecast, from the research that worked.
+        claude_forecasts = [json.dumps(body) for path, body in REQUESTS if body.get("model") == "claude-opus-5-5"]
+        self.assertEqual(len(claude_forecasts), 1)
+        self.assertIn("One research report follows", claude_forecasts[0])
+        self.assertIn("CLAUDE RESEARCH", claude_forecasts[0])
 
     def test_claude_lane_down_leaves_gpt_forecast(self) -> None:
         DOWN["anthropic"] = True
         bot, reports = forecast([make_question(1)])
         self.assertAlmostEqual(reports[0].prediction, 0.50)
-        self.assertEqual(len(bot.lane_stats["claude"].failures), 1)
+        self.assertEqual(len(bot.lane_stats["claude"].failed_questions), 1)
+        self.assertEqual(bot.lane_stats["gpt"].failures, [])
+        # The summary is written by the lane whose research worked.
+        self.assertGreater(bot.lane_stats["gpt"].summary_cost, 0)
 
     def test_both_lanes_down_fails_the_question(self) -> None:
         DOWN.update(anthropic=True, openai=True)
@@ -258,15 +272,30 @@ class CirrusTests(unittest.TestCase):
         self.assertIn("LaneCostCapReached", str(reports[0]))
         self.assertFalse(any("interviewing for a job" in json.dumps(body) for _, body in REQUESTS))
 
+    def test_cost_cap_only_benches_the_lane_that_overspent(self) -> None:
+        # In FakeProviders, Claude's research costs about $0.032 and GPT's $0.021.
+        original = cirrus.LANE_COST_CAP_USD
+        cirrus.LANE_COST_CAP_USD = 0.025
+        try:
+            bot, reports = forecast([make_question(1)])
+        finally:
+            cirrus.LANE_COST_CAP_USD = original
+        self.assertAlmostEqual(reports[0].prediction, 0.50)
+        self.assertEqual(len(bot.lane_stats["claude"].failed_questions), 1)
+        self.assertIn("LaneCostCapReached", bot.lane_stats["claude"].failures[0])
+        self.assertFalse(any(body.get("model") == "claude-opus-5-5" for _, body in REQUESTS))
+
     def test_costs_are_split_by_role(self) -> None:
         bot, _ = forecast([make_question(1)])
         for name in ("claude", "gpt"):
             stats = bot.lane_stats[name]
             self.assertGreater(stats.research_cost, 0)
             self.assertGreater(stats.forecast_cost, 0)
-            self.assertGreater(stats.summary_cost, 0)
             parts = stats.research_cost + stats.forecast_cost + stats.summary_cost
             self.assertAlmostEqual(parts, sum(stats.costs), places=6)
+        # The one summary per question is written by the first lane's helper.
+        self.assertGreater(bot.lane_stats["claude"].summary_cost, 0)
+        self.assertEqual(bot.lane_stats["gpt"].summary_cost, 0)
         self.assertIn("per question: research $", bot.lane_report())
 
     def test_reported_cost_matches_token_prices(self) -> None:
@@ -289,7 +318,6 @@ class CirrusTests(unittest.TestCase):
         )
         gpt = (
             cost(sol, 3000, 500) + search
-            + cost(luna, 3000, 500)
             + forecasts * cost(astra, 3000, 500)
             + parses * cost(luna, 3000, 500)
         )
@@ -401,14 +429,16 @@ class CirrusTests(unittest.TestCase):
             os.environ.pop("GITHUB_SHA")
         report = reports[0]
         record = cirrus.read_record(report.explanation)
-        self.assertEqual(record["cirrus_record"], 1)
+        self.assertEqual(record["cirrus_record"], 2)
+        self.assertEqual(record["design"], "pooled")
         self.assertEqual(record["commit"], "abc1234")
         self.assertEqual(record["question"]["type"], "BinaryQuestion")
         self.assertEqual(record["question"]["url"], "https://example.com/q/1")
-        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3, 0.3])
-        self.assertEqual(record["lanes"]["gpt"]["predictions"], [0.5, 0.5])
+        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3])
+        self.assertEqual(record["lanes"]["gpt"]["predictions"], [0.5])
         self.assertEqual(record["lanes"]["claude"]["forecast_model"], "anthropic/claude-opus-5-5")
         self.assertGreater(record["lanes"]["gpt"]["cost"], 0)
+        self.assertGreater(record["lanes"]["gpt"]["cost"], record["lanes"]["gpt"]["research_cost"])
         self.assertEqual(record["final"], 0.4)
         # The template's own sections are still where it expects them.
         self.assertIn("SUMMARY", report.summary)
@@ -418,9 +448,9 @@ class CirrusTests(unittest.TestCase):
         DOWN["openai"] = True
         _, reports = forecast([make_question(1)])
         record = cirrus.read_record(reports[0].explanation)
-        self.assertEqual(record["lanes"]["gpt"]["error"], "RateLimitError")
+        self.assertEqual(record["lanes"]["gpt"]["error"], "research: RateLimitError")
         self.assertEqual(record["lanes"]["gpt"]["predictions"], [])
-        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3, 0.3])
+        self.assertEqual(record["lanes"]["claude"]["predictions"], [0.3])
         self.assertEqual(record["final"], 0.3)
 
     def test_compact_prediction_handles_every_prediction_type(self) -> None:

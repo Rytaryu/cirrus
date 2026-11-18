@@ -166,6 +166,29 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(lane_review.main(["--from-json", str(saved)]), 0)
         self.assertEqual(printed.getvalue().strip(), report.strip())
 
+    def test_rows_carry_the_record_design_and_can_be_filtered(self) -> None:
+        separate = lane_review.score_question(
+            outcome("binary", "yes"), record("2026-11-14T00:00:00Z", [0.8], [0.6], 0.7)
+        )
+        pooled_record = {
+            **record("2026-11-19T00:00:00Z", [0.8], [0.6], 0.7),
+            "cirrus_record": 2,
+            "design": "pooled",
+        }
+        pooled = lane_review.score_question(outcome("binary", "yes", post_id=2), pooled_record)
+        self.assertEqual(separate["design"], "separate")
+        self.assertEqual(pooled["design"], "pooled")
+        self.assertEqual(
+            lane_review.summarize([separate, pooled])["by_design"], {"separate": 1, "pooled": 1}
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            saved = Path(folder) / "rows.json"
+            saved.write_text(json.dumps({"title": "test", "rows": [separate, pooled]}))
+            with redirect_stdout(io.StringIO()) as printed:
+                lane_review.main(["--from-json", str(saved), "--design", "pooled"])
+        self.assertIn("pooled design only", printed.getvalue())
+        self.assertIn("Designs: {'pooled': 1}", printed.getvalue())
+
     def test_empty_input_still_renders(self) -> None:
         report = lane_review.render(lane_review.summarize([]), [], "nothing yet")
         self.assertIn("0 resolved questions", report)
