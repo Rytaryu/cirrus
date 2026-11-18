@@ -193,7 +193,7 @@ GPT_FORECAST_EFFORT = "medium"
 
 # Reasoning effort of the GPT researcher. More effort lets it plan its searches
 # and look again for what is still missing. Reasoning tokens are billed as output.
-GPT_RESEARCH_EFFORT = "medium"
+GPT_RESEARCH_EFFORT = "high"
 
 # How much page content each GPT web search returns: low, medium or high.
 GPT_SEARCH_CONTEXT = "high"
