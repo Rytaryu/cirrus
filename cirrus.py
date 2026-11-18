@@ -73,6 +73,66 @@ logger = logging.getLogger(__name__)
 # tests/test_cirrus.py checks the reported cost against known token counts.
 LitellmCostTracker._initialized = True
 
+# litellm downloads its price list when it is imported and uses the copy bundled
+# with the installed version only if that download fails. The bundled copy in
+# litellm 1.105.1 (uv.lock) has no price for two of the bot's models, so after a
+# failed download their calls would count as free: the per-question spending
+# stop and the Discord cost summary would not see them. These entries fill that
+# gap only; a price litellm already has always wins. Each entry names the
+# provider, a related model whose features it copies, and the provider's list
+# prices in USD per token.
+FALLBACK_PRICES: dict[str, tuple[str, str, dict[str, float]]] = {
+    # GPT-6.2 Astra, released 2026-11-17: $8 / $40, cached input $0.40.
+    "gpt-6.2-astra": (
+        "openai",
+        "gpt-6-astra",
+        {
+            "input_cost_per_token": 8e-6,
+            "output_cost_per_token": 4e-5,
+            "cache_read_input_token_cost": 4e-7,
+        },
+    ),
+    # Claude Haiku 5.5: $0.10 / $0.50, cache reads $0.01, cache writes $0.125.
+    "claude-haiku-5-5": (
+        "anthropic",
+        "claude-sonnet-5-5",
+        {
+            "input_cost_per_token": 1e-7,
+            "output_cost_per_token": 5e-7,
+            "cache_read_input_token_cost": 1e-8,
+            "cache_creation_input_token_cost": 1.25e-7,
+        },
+    ),
+}
+
+
+def add_missing_prices() -> list[str]:
+    """Register FALLBACK_PRICES for models litellm has no price for. Returns their names."""
+    import litellm
+
+    added = []
+    for model, (provider, template, prices) in FALLBACK_PRICES.items():
+        if model in litellm.model_cost:
+            continue
+        # Keep the related model's features, drop all of its prices (including
+        # tiered ones such as long-context or batch rates) and set ours.
+        entry = {
+            key: value
+            for key, value in litellm.model_cost.get(template, {}).items()
+            if "cost" not in key
+        }
+        entry.update(prices)
+        entry["litellm_provider"] = provider
+        entry.setdefault("mode", "chat")
+        litellm.register_model({model: entry})
+        added.append(model)
+    if added:
+        logger.warning(f"litellm had no price for {added}; using cirrus's fallback prices")
+    return added
+
+
+add_missing_prices()
+
 
 class ResponsesLlm(GeneralLlm):
     """
@@ -190,13 +250,17 @@ LANES: dict[str, Lane] = {
             timeout=300,
             allowed_tries=2,
         ),
-        # GPT-6 Astra ($10 / $50), OpenAI's most capable model. The first test
+        # GPT-6.2 Astra ($8 / $40), OpenAI's most capable model. The first test
         # runs used GPT-6.1 Sol here and the lane cost about $0.14 per question,
         # of which the two forecasts were only $0.02; the judgment step is where
         # the lane's spare budget goes. Reasoning tokens are billed as output,
-        # so the effort setting is the main cost control.
+        # so the effort setting is the main cost control. Until 2026-11-18 this
+        # was GPT-6 Astra ($10 / $50); GPT-6.2 Astra is 20% cheaper per token
+        # and scores higher on OpenAI's and independent general benchmarks
+        # (none of them measures forecasting). Each lane's record names the
+        # model it used, so forecasts from before and after can be told apart.
         forecaster=lambda: ResponsesLlm(
-            model="openai/gpt-6-astra",
+            model="openai/gpt-6.2-astra",
             reasoning={"effort": GPT_FORECAST_EFFORT},
             max_output_tokens=12000,
             timeout=300,
