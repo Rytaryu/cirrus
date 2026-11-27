@@ -17,6 +17,9 @@ from pathlib import Path
 
 REQUESTS: list[tuple[str, dict]] = []
 DOWN = {"anthropic": False, "openai": False}
+# Probabilities Haiku "reads" on its next parser calls, one per call. When it
+# runs out it reads the forecast correctly again.
+HAIKU_READINGS: list[float] = []
 CLAUDE_FORECAST = "(a) Two months are left ... Probability: 30%"
 GPT_FORECAST = "(a) Two months are left ... Probability: 50%"
 
@@ -56,7 +59,8 @@ class FakeProviders(BaseHTTPRequestHandler):
             ]
             usage = {"input_tokens": 9000, "output_tokens": 400, "server_tool_use": {"web_search_requests": 1}}
         elif is_parser:
-            content = [{"type": "text", "text": json.dumps({"prediction_in_decimal": _probability_in(flat)})}]
+            reading = HAIKU_READINGS.pop(0) if HAIKU_READINGS else _probability_in(flat)
+            content = [{"type": "text", "text": json.dumps({"prediction_in_decimal": reading})}]
             usage = {"input_tokens": 900, "output_tokens": 20}
         elif is_summary:
             content = [{"type": "text", "text": "Claude summary."}]
@@ -169,6 +173,7 @@ class CirrusTests(unittest.TestCase):
     def setUp(self) -> None:
         REQUESTS.clear()
         DOWN.update(anthropic=False, openai=False)
+        HAIKU_READINGS.clear()
         os.environ.pop("CIRRUS_LANES", None)
 
     def test_both_lanes_are_aggregated(self) -> None:
@@ -238,6 +243,41 @@ class CirrusTests(unittest.TestCase):
         self.assertEqual(bot.lane_stats["gpt"].failures, [])
         # The summary is written by the lane whose research worked.
         self.assertGreater(bot.lane_stats["gpt"].summary_cost, 0)
+
+    def _haiku_parser_calls(self) -> int:
+        return sum(
+            1
+            for _, body in REQUESTS
+            if body.get("model") == "claude-haiku-5-5" and "START TEXT" in json.dumps(body)
+        )
+
+    def test_parser_readings_that_agree_need_no_third_reading(self) -> None:
+        forecast([make_question(1)])
+        self.assertEqual(self._haiku_parser_calls(), 2)
+
+    def test_parser_disagreement_is_settled_by_a_third_reading(self) -> None:
+        # Haiku reads Opus's 30% as 30%, then 35%; the third reading is 30%.
+        HAIKU_READINGS.extend([0.30, 0.35])
+        with self.assertLogs("cirrus", level="WARNING") as logs:
+            bot, reports = forecast([make_question(1)])
+        self.assertEqual(self._haiku_parser_calls(), 3)
+        self.assertAlmostEqual(reports[0].prediction, 0.40)
+        self.assertEqual(reports[0].errors, [])
+        self.assertEqual(bot.lane_stats["claude"].failures, [])
+        warning = "\n".join(logs.output)
+        self.assertIn("2 of 3 agreed on", warning)
+        # The readings themselves stay out of the (public) log.
+        self.assertNotIn("0.35", warning)
+
+    def test_parser_with_no_majority_drops_the_forecast(self) -> None:
+        HAIKU_READINGS.extend([0.30, 0.35, 0.40])
+        bot, reports = forecast([make_question(1)])
+        self.assertEqual(self._haiku_parser_calls(), 3)
+        # Only GPT's 50% is left.
+        self.assertAlmostEqual(reports[0].prediction, 0.50)
+        self.assertEqual(len(bot.lane_stats["claude"].failed_questions), 1)
+        self.assertIn("ParserDisagreement", bot.lane_stats["claude"].failures[0])
+        self.assertNotIn("0.35", bot.lane_stats["claude"].failures[0])
 
     def test_both_lanes_down_fails_the_question(self) -> None:
         DOWN.update(anthropic=True, openai=True)

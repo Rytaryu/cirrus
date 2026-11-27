@@ -28,7 +28,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar
 
 import dotenv
 import requests
@@ -58,7 +58,11 @@ from forecasting_tools.data_models.forecast_report import (  # noqa: E402
 from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (  # noqa: E402
     LitellmCostTracker,
 )
+from forecasting_tools.helpers.structure_output import (  # noqa: E402
+    DEFAULT_STRUCTURE_OUTPUT_MODEL,
+)
 
+import main as template  # noqa: E402
 from main import FallTemplateBot2026  # noqa: E402
 
 dotenv.load_dotenv()
@@ -384,6 +388,80 @@ _current_question: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 class LaneCostCapReached(RuntimeError):
     """A lane spent more than LANE_COST_CAP_USD on one question's research."""
+
+
+# =============================================================================
+# PARSING
+# =============================================================================
+#
+# The template turns each forecaster's text into numbers with the lane's cheap
+# "parser" model (structure_output). It reads the text twice and drops the
+# forecast if the two readings differ. On 2026-11-27 Haiku read Opus's answer
+# to a multiple-choice question (46756) twice and swapped two options'
+# probabilities, so the Claude lane lost its forecast on that question.
+#
+# Readings that differ now get one more reading. If two of the three agree,
+# that answer is used; if all three differ, the forecast is dropped as before.
+# The extra reading is one parser call, well under a cent.
+#
+# Neither the log line nor the error shows the readings: the logs of this
+# public repository should not show forecasts on questions that are still open.
+
+PARSE_TIEBREAK_READINGS = 1
+
+T = TypeVar("T")
+
+_template_structure_output = template.structure_output
+
+
+class ParserDisagreement(ValueError):
+    """The parser read a forecast several ways and no reading had a majority."""
+
+
+async def structure_output_by_majority(
+    text_to_structure: str,
+    output_type: type[T],
+    model: GeneralLlm | str = DEFAULT_STRUCTURE_OUTPUT_MODEL,
+    num_validation_samples: int = 1,
+    allowed_tries: int = 3,
+    additional_instructions: str | None = None,
+) -> T:
+    """structure_output, but readings that differ are settled by a majority."""
+    if num_validation_samples < 1:
+        raise ValueError("Number of samples must be at least 1")
+
+    async def read_once() -> T:
+        return await _template_structure_output(
+            text_to_structure,
+            output_type,
+            model=model,
+            num_validation_samples=1,
+            allowed_tries=allowed_tries,
+            additional_instructions=additional_instructions,
+        )
+
+    readings = [await read_once() for _ in range(num_validation_samples)]
+    if all(reading == readings[0] for reading in readings):
+        return readings[0]
+    for _ in range(PARSE_TIEBREAK_READINGS):
+        readings.append(await read_once())
+    where = f"[{_current_lane.get()}] {_current_question.get()}"
+    for candidate in readings:
+        if 2 * sum(reading == candidate for reading in readings) > len(readings):
+            logger.warning(
+                f"{where}: the parser's readings of a forecast differed; "
+                f"used the reading that {sum(r == candidate for r in readings)} "
+                f"of {len(readings)} agreed on."
+            )
+            return candidate
+    raise ParserDisagreement(
+        f"The parser read the forecast {len(readings)} times and no reading had "
+        "a majority, so the text is ambiguous."
+    )
+
+
+# main.py looks structure_output up in its own module each time it parses.
+template.structure_output = structure_output_by_majority
 
 
 # =============================================================================
